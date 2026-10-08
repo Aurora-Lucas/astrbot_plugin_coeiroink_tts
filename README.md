@@ -21,6 +21,13 @@
 
 ---
 
+> ### 📢 渠道支持
+> 本插件可以联动 **NapCat** 使用 QQ 语音；其他渠道暂未测试。
+> 如您在其他渠道测试过，请提供测试环境及日志，提交报告到 GitHub：
+> https://github.com/Aurora-Lucas/astrbot_plugin_coeiroink_tts/issues
+
+---
+
 ## 一、三种风格对照表
 
 | 中文名 | styleId | 日文名 | 说明 |
