@@ -1,7 +1,7 @@
 # Tsukuyomi-chan COEIROINK 日语语音插件 · 结构说明（PLUGIN_STRUCTURE）
 
 > 本文档由代码实地梳理生成，只描述当前源码中**真实存在**的内容。
-> 版本：对应 `metadata.yaml` 的 `1.9.0`（v1.2.0 起插件通用化：不再内置任何机器相关路径；
+> 版本：对应 `metadata.yaml` 的 `1.10.0`（v1.2.0 起插件通用化：不再内置任何机器相关路径；
 > v1.2.1 起显示名改为 Tsukuyomi-chan COEIROINK 日语语音，并附音源/软件致谢；
 > v1.2.2 起补充 Logo 作者声明；v1.2.3 起补充渠道支持说明；
 > v1.3.0 起内置 Web UI 图形化管理面板（可开关，开启后原配置面板仅保留开关）；
@@ -24,7 +24,8 @@
 > Web UI 引擎日志与重启引擎、分段段数可配置、行为层测试；
 > 1.7.1 起「管理面板」标签页内新增二级菜单（监控 / 设置），功能分组不再一屏堆叠；
 > 1.8.0 起性能优化：合成结果 LRU 缓存、is_japanese/clean_text 快路径、内存读数与地址校验缓存；
-> 1.9.0 起新增句级缓存（按句/小句复用音频 + ffmpeg 拼接为一条语音，键可忽略结尾标点））。
+> 1.9.0 起新增句级缓存（按句/小句复用音频 + ffmpeg 拼接为一条语音，键可忽略结尾标点）；
+> 1.10.0 起新增长期保留池：命中统计 + 定期 LLM 复审晋级，池内音频不受临时清理影响（索引落盘可跨重启）。
 > 无法从代码/环境中确认的点，统一用「**待确认**」标注，不做臆测。
 
 > ### 🔊 音源与软件致谢
@@ -64,7 +65,7 @@
 
 | 文件 | 职责 |
 | --- | --- |
-| `metadata.yaml` | 插件标识 `name: astrbot_plugin_coeiroink_tts`、`display_name: Tsukuyomi-chan COEIROINK 日语语音`、`version: 1.9.0`、`author: Aurora & deepseek`；市场字段：`repo`（GitHub 地址）、`short_desc`、`support_platforms: [aiocqhttp]`（NapCat/OneBot v11，已实测）、`astrbot_version: ">=4.24.5,<5"`（插件 Pages 最早可用版本）、`category: utilities`、`tags` |
+| `metadata.yaml` | 插件标识 `name: astrbot_plugin_coeiroink_tts`、`display_name: Tsukuyomi-chan COEIROINK 日语语音`、`version: 1.10.0`、`author: Aurora & deepseek`；市场字段：`repo`（GitHub 地址）、`short_desc`、`support_platforms: [aiocqhttp]`（NapCat/OneBot v11，已实测）、`astrbot_version: ">=4.24.5,<5"`（插件 Pages 最早可用版本）、`category: utilities`、`tags` |
 | `main.py` | 全部实现：常量、默认配置、风格归一化、文本清洗、引擎探测/拉起、合成链路、翻译、TTS Provider 适配器、插件主体（自动触发 + 命令 + LLM 工具） |
 | `_conf_schema.json` | 配置项定义，AstrBot 据此渲染配置面板；键名与 `main.py` 中 `DEFAULT_CONFIG` 一一对应 |
 | `README.md` | 用户文档：风格对照、配置方法、单次切换用法、非法值行为、内存提示 |
@@ -97,6 +98,8 @@
 - `_MEM_CACHE_TTL = 2.0` / `_API_LOCAL_CACHE`：可用内存读数短 TTL 缓存、回环判定备忘（1.8.0 性能）
 - `_KANA_SET` / `_KANA_DELETE_TABLE`：假名码点集合与 translate 删除表（`is_japanese` 快路径）
 - `_CLAUSE_ENDERS_RE` / `_PHRASE_TAIL_PUNCT_RE`：小句边界正则、句级缓存键的结尾标点清理（1.9.0）
+- `_POOL_*` 常量与 `_POOL_REVIEW_PROMPT`：长期池目录名/索引名/复审延迟/候选上限/统计上限与 LLM 复审提示词（1.10.0）
+- `resolve_pool_dir()` / `synth_key_to_json()` / `synth_key_from_json()` / `parse_pool_review_response()`：池目录解析、缓存键序列化、复审响应解析（1.10.0）
 - `DEFAULT_CONFIG`：插件默认配置字典（键与 `_conf_schema.json` 对应，共 28 项；含 `enable_webui`、`max_concurrent_synth`、`max_synth_queue`、`max_synth_segments`、`allow_style_override`、`style_switch_min_free_mb`、`allow_remote_engine`）
 - 通用解析函数（环境相关路径统一走「配置项 → 环境变量 → 自动推导」）：
   - `resolve_engine_dir(cfg) -> str`：引擎根目录（配置 > `COEIROINK_ENGINE_DIR`）
@@ -164,11 +167,16 @@
 - `_synthesize_all(text, style_id, *, already_cleaned=False) -> list[str]`：先查整段精确缓存；`phrase_cache_enabled` 时按句/小句查句级缓存并只合成未命中句，再用 `_concat_audio` 拼接为**一条**语音（失败回退逐段）；关闭句级缓存时沿用原「整段 / 合并分段」逻辑（1.9.0）
 - `_phrase_cache_get/_phrase_cache_put/_phrase_cache_lookup_key`：句级缓存读写与键归一化（LRU，`phrase_cache_size`）
 - `_concat_audio(paths) -> str | None`：ffmpeg concat demuxer 拼接多段音频（按扩展名选择 mp3/wav 编码），失败返回 None
+- `_record_use(key, path)`：缓存/池命中统计（供复频率复审）
+- `_pool_lookup(key)` / `_pool_candidates()` / `_pool_promote()` / `_pool_drop()`：长期池查找、候选筛选、晋升（复制进插件数据目录）、删除
+- `_pool_enforce_limits()` / `_pool_expire()`：超限淘汰（命中数 + 最近使用）、按保留天数回收
+- `_pool_save_index()` / `_pool_load_index()`：`index.json` 落盘与启动恢复
+- `_llm_review_pool()` / `_pool_review_once()` / `_pool_review_loop()`：LLM 复审（失败回退规则）、单次复审、后台周期循环
 - `_synthesize(text, style_id) -> str | None`：单段合成（保持原语义：超长按配置跳过或截断），供测试合成等短文本场景使用
 - `_to_japanese(text, umo)`：调用 `translate_to_japanese`
 - **Web UI（插件 Pages）**：
   - `_webui_enabled()`：读取 `enable_webui` 配置
-  - `_register_web_apis()`：`context.register_web_api` 注册 8 条路由（前缀 `/{_PLUGIN_NAME}`，`_PLUGIN_NAME` 与 metadata 的 name 一致）：`GET/POST /config`、`GET /status`、`POST /test`、`GET /logs`（引擎日志尾部）、`POST /engine_restart`（重启引擎）、`GET /install_info`、`POST /install_check_path`、`POST /install_launch_engine`（共 8 条路由）；框架对同路由同方法幂等（自动替换），热重载安全；**老版本 AstrBot 缺少 `astrbot.api.web` 或 `register_web_api` 时自动跳过（降级为无 Web UI）**（P1-1）
+  - `_register_web_apis()`：`context.register_web_api` 注册 9 条路由（前缀 `/{_PLUGIN_NAME}`，`_PLUGIN_NAME` 与 metadata 的 name 一致）：`GET/POST /config`、`GET /status`、`POST /test`、`GET /logs`（引擎日志尾部）、`POST /engine_restart`（重启引擎）、`POST /pool_review`（立即复审长期池）、`GET /install_info`、`POST /install_check_path`、`POST /install_launch_engine`（共 8 条路由）；框架对同路由同方法幂等（自动替换），热重载安全；**老版本 AstrBot 缺少 `astrbot.api.web` 或 `register_web_api` 时自动跳过（降级为无 Web UI）**（P1-1）
   - `_save_config() -> bool`：把 `self.config` 经 `AstrBotConfig.save_config_async()` 写回配置文件（不阻塞事件循环）
   - `_webui_get_config()`：返回当前配置 + 风格/模式选项表
   - `_webui_save_config()`：只接受已知键，按 int/float/bool/str 类型收敛；`mode` 必须在 `VALID_MODES` 内、`style_id` 必须可归一化；非法值返回 400 错误响应（`astrbot.api.web` 的 `request / json_response / error_response`）
@@ -239,6 +247,12 @@
 | `phrase_cache_size` | int | `128` | 句级缓存条数（1.9.0；0=禁用） |
 | `phrase_split_mode` | string | `sentence` | 句级切分粒度：`sentence` / `clause`（1.9.0） |
 | `phrase_key_ignore_punct` | bool | `true` | 句级键忽略结尾标点（1.9.0） |
+| `phrase_pool_enabled` | bool | `true` | 长期保留池总开关（1.10.0） |
+| `phrase_pool_min_hits` | int | `3` | 晋级门槛（命中次数，1.10.0） |
+| `phrase_pool_max_entries` | int | `64` | 池容量上限（1.10.0） |
+| `phrase_pool_retention_days` | int | `30` | 池条目保留天数（0=永久，1.10.0） |
+| `phrase_pool_llm_review` | bool | `true` | 复审是否使用 LLM（失败回退规则，1.10.0） |
+| `phrase_pool_review_hours` | int | `24` | 复审周期（小时，1.10.0） |
 | `allow_style_override` | bool | `true` | 是否允许单次风格切换；关闭后只用默认风格（1.7.0） |
 | `style_switch_min_free_mb` | int | `800` | 切换到未加载风格前的最低可用内存（1.7.0） |
 | `allow_remote_engine` | bool | `false` | 允许向非回环地址的引擎发送文本（P2-5）；默认禁止防外发 |

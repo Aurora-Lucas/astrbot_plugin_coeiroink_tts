@@ -254,5 +254,47 @@
         "type": "bool",
         "default": true,
         "invisible": true
+    },
+    "phrase_pool_enabled": {
+        "description": "启用长期保留池",
+        "hint": "开启后，定期复审高复用片段并晋级到插件数据目录长期保存（不再随临时文件清理）。",
+        "type": "bool",
+        "default": true,
+        "invisible": true
+    },
+    "phrase_pool_min_hits": {
+        "description": "长期池晋升门槛（命中次数）",
+        "hint": "片段的累计复用命中次数达到该值才进入候选。默认 3。",
+        "type": "int",
+        "default": 3,
+        "invisible": true
+    },
+    "phrase_pool_max_entries": {
+        "description": "长期池容量上限",
+        "hint": "长期池最多保留多少条音频；超出时按「命中次数 + 最近使用」淘汰。默认 64。",
+        "type": "int",
+        "default": 64,
+        "invisible": true
+    },
+    "phrase_pool_retention_days": {
+        "description": "长期池保留天数",
+        "hint": "长期池条目多少天未被使用即回收；0 表示永久保留。默认 30。",
+        "type": "int",
+        "default": 30,
+        "invisible": true
+    },
+    "phrase_pool_llm_review": {
+        "description": "复审时使用 LLM",
+        "hint": "开启后由当前对话模型复审候选（判断通用问候/口头禅等值得长期保留）；无可用模型或调用失败时自动回退为纯规则晋升。",
+        "type": "bool",
+        "default": true,
+        "invisible": true
+    },
+    "phrase_pool_review_hours": {
+        "description": "复审周期（小时）",
+        "hint": "后台复审的执行间隔，默认 24 小时。",
+        "type": "int",
+        "default": 24,
+        "invisible": true
     }
 }

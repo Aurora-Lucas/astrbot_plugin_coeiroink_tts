@@ -36,6 +36,9 @@ def _make_plugin(**overrides):
     plugin._loaded_styles = set()
     plugin._synth_cache = OrderedDict()  # 真实类在 __init__ 中初始化
     plugin._phrase_cache = OrderedDict()
+    plugin._usage = {}
+    plugin._pool = {}
+    plugin._pool_task = None
     plugin._bg_tasks = set()
     plugin._warmup_task = None
     plugin._cleanup_task = None
@@ -386,3 +389,216 @@ def test_phrase_cache_exact_punct_mode_when_disabled(tmp_path, monkeypatch):
     calls["texts"].clear()
     asyncio.run(plugin._synthesize_all("いい天気ですね、散歩に行きましょう。", 5))
     assert calls["texts"] == ["いい天気ですね、", "散歩に行きましょう。"]  # 标点不同 => 不复用
+
+
+# ---------------------------------------------------------------------------
+# 长期保留池（分层治理 + LLM 复审，1.10.0）
+# ---------------------------------------------------------------------------
+
+
+def _pool_plugin(tmp_path, monkeypatch, **overrides):
+    """启用长期池的插件实例；池目录指向 tmp_path。"""
+    cfg = dict(
+        api_base="http://127.0.0.1:50032",
+        max_concurrent_synth=1,
+        max_synth_queue=4,
+        synth_cache_size=8,
+        phrase_cache_enabled=True,
+        phrase_cache_size=8,
+        phrase_pool_enabled=True,
+        phrase_pool_min_hits=2,
+        phrase_pool_max_entries=4,
+        phrase_pool_retention_days=30,
+        phrase_pool_llm_review=False,
+    )
+    cfg.update(overrides)
+    plugin = _make_plugin(**cfg)
+    pool_dir = tmp_path / "pool"
+    monkeypatch.setattr(m, "resolve_pool_dir", lambda: pool_dir)
+    return plugin, pool_dir
+
+
+def _seed_usage(plugin, text, hits, path, style_id=5):
+    key = plugin._synth_cache_key(text, style_id)
+    plugin._usage[key] = {"hits": hits, "ts": time.time(), "text": text, "path": str(path)}
+    return key
+
+
+def test_key_json_roundtrip():
+    key = ("你好", 5, 1.0, "uuid-x", 0, True)
+    assert m.synth_key_from_json(m.synth_key_to_json(key)) == key
+    assert m.synth_key_from_json([1, 2]) is None  # 结构不合法
+
+
+def test_parse_pool_review_response_variants():
+    assert m.parse_pool_review_response('{"keep": [0, 1], "evict": [2], "reason": "ok"}') == {
+        "keep": [0, 1],
+        "evict": [2],
+        "reason": "ok",
+    }
+    fenced = m.parse_pool_review_response('```json\n{"keep": [1], "reason": "x"}\n```')
+    assert fenced and fenced["keep"] == [1] and fenced["evict"] == []
+    noisy = m.parse_pool_review_response('结果为：{"keep": ["2"], "evict": []} 完毕')
+    assert noisy and noisy["keep"] == [2]
+    assert m.parse_pool_review_response("不是 JSON") is None
+
+
+def test_record_use_counts_hits(tmp_path, monkeypatch):
+    plugin, _ = _pool_plugin(tmp_path, monkeypatch)
+    audio = tmp_path / "a.mp3"
+    audio.write_bytes(b"x")
+    key = _seed_usage(plugin, "こんにちは", 1, audio)
+    plugin._record_use(key, str(audio))
+    assert plugin._usage[key]["hits"] == 2
+
+
+def test_pool_lookup_prefers_pool_and_counts(tmp_path, monkeypatch):
+    plugin, pool_dir = _pool_plugin(tmp_path, monkeypatch)
+    pool_dir.mkdir(parents=True, exist_ok=True)
+    pooled = pool_dir / "p.mp3"
+    pooled.write_bytes(b"x")
+    key = plugin._synth_cache_key("おはよう", 5)
+    plugin._pool[key] = {
+        "path": str(pooled),
+        "text": "おはよう",
+        "hits": 0,
+        "last_used": 0.0,
+        "promoted_at": 0.0,
+    }
+    assert plugin._synth_cache_get(key) == str(pooled)
+    assert plugin._pool[key]["hits"] == 1
+    assert plugin._usage[key]["hits"] == 1
+
+
+def test_pool_candidates_respect_threshold(tmp_path, monkeypatch):
+    plugin, _ = _pool_plugin(tmp_path, monkeypatch)
+    audio = tmp_path / "a.mp3"
+    audio.write_bytes(b"x")
+    _seed_usage(plugin, "高い", 5, audio)
+    _seed_usage(plugin, "低い", 1, audio)  # 未达门槛 2
+    candidates = plugin._pool_candidates()
+    assert [c["text"] for c in candidates] == ["高い"]
+
+
+def test_pool_promote_copies_and_clears_temp_cache(tmp_path, monkeypatch):
+    plugin, pool_dir = _pool_plugin(tmp_path, monkeypatch)
+    audio = tmp_path / "src.mp3"
+    audio.write_bytes(b"audio-bytes")
+    key = plugin._synth_cache_key("ありがとう", 5)
+    plugin._synth_cache[key] = str(audio)
+    plugin._phrase_cache[key] = str(audio)
+    _seed_usage(plugin, "ありがとう", 3, audio)
+
+    assert plugin._pool_promote(plugin._pool_candidates()[0]) is True
+    entry = plugin._pool[key]
+    assert os.path.isfile(entry["path"]) and entry["path"].startswith(str(pool_dir))
+    assert key not in plugin._synth_cache and key not in plugin._phrase_cache
+
+
+def test_pool_review_rule_based_promotes(tmp_path, monkeypatch):
+    plugin, _ = _pool_plugin(tmp_path, monkeypatch)
+    audio = tmp_path / "a.mp3"
+    audio.write_bytes(b"x")
+    _seed_usage(plugin, "おはよう", 4, audio)
+    result = asyncio.run(plugin._pool_review_once())
+    assert result["llm_used"] is False
+    assert result["promoted"] == 1 and result["pool_entries"] == 1
+
+
+def test_pool_review_uses_llm_keep_list(tmp_path, monkeypatch):
+    plugin, _ = _pool_plugin(tmp_path, monkeypatch, phrase_pool_llm_review=True)
+    audio = tmp_path / "a.mp3"
+    audio.write_bytes(b"x")
+    _seed_usage(plugin, "汎用の挨拶", 5, audio)
+    _seed_usage(plugin, "一度きりの長文", 5, audio)
+
+    class FakeProvider:
+        async def text_chat(self, prompt=None, system_prompt=None, **kw):
+            return type(
+                "R", (), {"completion_text": '{"keep": [0], "evict": [], "reason": "保留问候"}'}
+            )()
+
+    class FakeContext:
+        async def get_using_provider_async(self, umo=None):
+            return FakeProvider()
+
+    plugin.context = FakeContext()
+    result = asyncio.run(plugin._pool_review_once())
+    assert result["llm_used"] is True and result["promoted"] == 1
+    assert result["reason"] == "保留问候"
+
+
+def test_pool_review_falls_back_when_llm_returns_garbage(tmp_path, monkeypatch):
+    plugin, _ = _pool_plugin(tmp_path, monkeypatch, phrase_pool_llm_review=True)
+    audio = tmp_path / "a.mp3"
+    audio.write_bytes(b"x")
+    _seed_usage(plugin, "おはよう", 3, audio)
+
+    class FakeProvider:
+        async def text_chat(self, prompt=None, system_prompt=None, **kw):
+            return type("R", (), {"completion_text": "我觉得都很好"})()  # 非 JSON
+
+    class FakeContext:
+        async def get_using_provider_async(self, umo=None):
+            return FakeProvider()
+
+    plugin.context = FakeContext()
+    result = asyncio.run(plugin._pool_review_once())
+    assert result["llm_used"] is False  # 解析失败 => 回退规则
+    assert result["promoted"] == 1
+
+
+def test_pool_enforce_limits_evicts_lowest_hits(tmp_path, monkeypatch):
+    plugin, pool_dir = _pool_plugin(tmp_path, monkeypatch, phrase_pool_max_entries=2)
+    pool_dir.mkdir(parents=True, exist_ok=True)
+    for i, hits in enumerate((1, 9, 5)):
+        f = pool_dir / f"p{i}.mp3"
+        f.write_bytes(b"x")
+        key = plugin._synth_cache_key(f"text{i}", 5)
+        plugin._pool[key] = {
+            "path": str(f),
+            "text": f"text{i}",
+            "hits": hits,
+            "last_used": time.time(),
+            "promoted_at": 0.0,
+        }
+    removed = plugin._pool_enforce_limits()
+    assert removed == 1 and len(plugin._pool) == 2
+    assert all(v["hits"] > 1 for v in plugin._pool.values())  # 命中最低的被淘汰
+
+
+def test_pool_expire_removes_stale_entries(tmp_path, monkeypatch):
+    plugin, pool_dir = _pool_plugin(tmp_path, monkeypatch, phrase_pool_retention_days=1)
+    pool_dir.mkdir(parents=True, exist_ok=True)
+    old_file = pool_dir / "old.mp3"
+    old_file.write_bytes(b"x")
+    key = plugin._synth_cache_key("古い", 5)
+    plugin._pool[key] = {
+        "path": str(old_file),
+        "text": "古い",
+        "hits": 9,
+        "last_used": time.time() - 3 * 86400,
+        "promoted_at": 0.0,
+    }
+    assert plugin._pool_expire() == 1
+    assert key not in plugin._pool and not old_file.exists()
+
+
+def test_pool_index_roundtrip(tmp_path, monkeypatch):
+    plugin, pool_dir = _pool_plugin(tmp_path, monkeypatch)
+    pool_dir.mkdir(parents=True, exist_ok=True)
+    audio = pool_dir / "keep.mp3"
+    audio.write_bytes(b"x")
+    key = plugin._synth_cache_key("保存される", 5)
+    plugin._pool[key] = {
+        "path": str(audio),
+        "text": "保存される",
+        "hits": 7,
+        "last_used": 123.0,
+        "promoted_at": 100.0,
+    }
+    assert plugin._pool_save_index() is True
+
+    other, _ = _pool_plugin(tmp_path, monkeypatch)
+    assert other._pool_load_index() == 1
+    assert other._pool[key]["hits"] == 7 and other._pool[key]["path"] == str(audio)

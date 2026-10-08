@@ -13,6 +13,7 @@ Logo：ノザラシ制作（https://seiga.nicovideo.jp/seiga/im11798588）
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import platform
 import random
@@ -43,7 +44,10 @@ except ImportError:  # pragma: no cover - 仅老版本 AstrBot 触发
 from astrbot.core.agent.tool import FunctionTool
 from astrbot.core.provider.provider import TTSProvider
 from astrbot.core.provider.register import register_provider_adapter
-from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
+from astrbot.core.utils.astrbot_path import (
+    get_astrbot_plugin_data_path,
+    get_astrbot_temp_path,
+)
 
 # ---------------------------------------------------------------------------
 # 常量与默认配置
@@ -99,6 +103,25 @@ _SYNTH_INFLIGHT = 0
 # 引擎日志尾读上限（Web UI「引擎日志」用）
 _LOG_TAIL_BYTES = 64 * 1024
 
+# 长期保留池（音频分层治理）
+_POOL_DIR_NAME = "phrase_pool"  # 插件数据目录下的子目录
+_POOL_INDEX_NAME = "index.json"
+_POOL_REVIEW_FIRST_DELAY = 300.0  # 启动后首次复审延迟（秒）
+_POOL_MAX_CANDIDATES = 30  # 单次交给 LLM 复审的候选上限（控制 prompt 体积）
+_USAGE_MAX_TRACKED = 512  # 命中统计最多保留多少条（按最近使用淘汰）
+
+_POOL_REVIEW_PROMPT = (
+    "你是语音合成插件的缓存治理助手。用户会给出语音片段的统计信息（JSON）："
+    "candidates 是近期复用较多的片段（含 id、文本、命中次数、字符数、是否长文），"
+    "pool 是当前长期保留池中的片段。\n"
+    "请判断哪些 candidates 值得放入长期保留池：优先保留通用问候/寒暄、口头禅、"
+    "模板化固定回复、命中次数高且文本较短的片段；可以丢弃一次性长文或高度具体、"
+    "几乎不会复现的内容。\n"
+    "若 pool 条目过多，可给出建议淘汰的 id。\n"
+    "只输出 JSON，不要解释、不要代码块，格式："
+    '{"keep": [id...], "evict": [id...], "reason": "一句话理由"}'
+)
+
 DEFAULT_CONFIG: dict[str, Any] = {
     "enabled": True,
     "mode": "on_demand",
@@ -121,6 +144,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "phrase_cache_size": 128,
     "phrase_split_mode": "sentence",  # sentence=按句；clause=按小句（含逗号）
     "phrase_key_ignore_punct": True,  # 句级缓存键忽略结尾标点（提升复用率）
+    # 长期保留池：定期复审高复用片段并晋级保存（不再随临时文件清理）
+    "phrase_pool_enabled": True,
+    "phrase_pool_min_hits": 3,
+    "phrase_pool_max_entries": 64,
+    "phrase_pool_retention_days": 30,
+    "phrase_pool_llm_review": True,
+    "phrase_pool_review_hours": 24,
     "allow_style_override": True,
     "style_switch_min_free_mb": 800,
     "allow_remote_engine": False,
@@ -134,6 +164,83 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "ffmpeg_path": DEFAULT_FFMPEG,
     "translate_system_prompt": DEFAULT_TRANSLATE_PROMPT,
 }
+
+
+def synth_key_to_json(key: tuple[Any, ...]) -> list[Any]:
+    """把合成缓存键转成可写入 JSON 的列表（顺序与 `_synth_cache_key` 一致）。"""
+    return [
+        str(key[0]),
+        int(key[1]),
+        float(key[2]),
+        str(key[3]),
+        int(key[4]),
+        bool(key[5]),
+    ]
+
+
+def synth_key_from_json(data: Any) -> tuple[Any, ...] | None:
+    """从 JSON 列表还原合成缓存键；结构不合法时返回 None。"""
+    try:
+        return (
+            str(data[0]),
+            int(data[1]),
+            float(data[2]),
+            str(data[3]),
+            int(data[4]),
+            bool(data[5]),
+        )
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def parse_pool_review_response(raw: str) -> dict[str, Any] | None:
+    """解析 LLM 复审返回的 JSON（容忍代码块包裹与多余文字）。
+
+    返回 {"keep": [int...], "evict": [int...], "reason": str}；无法解析返回 None。
+    """
+    text = (raw or "").strip()
+    if not text:
+        return None
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\s*", "", text)
+        text = re.sub(r"\s*```$", "", text).strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        data = json.loads(text[start : end + 1])
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    def _ids(value: Any) -> list[int]:
+        out: list[int] = []
+        if isinstance(value, list):
+            for item in value:
+                try:
+                    out.append(int(item))
+                except (TypeError, ValueError):
+                    continue
+        return out
+
+    return {
+        "keep": _ids(data.get("keep")),
+        "evict": _ids(data.get("evict")),
+        "reason": str(data.get("reason") or ""),
+    }
+
+
+def resolve_pool_dir() -> Path | None:
+    """长期保留池目录：AstrBot 插件数据目录下（与临时目录隔离，不参与定时清理）。
+
+    取不到插件数据目录时返回 None（此时池功能自动停用，不影响合成）。
+    """
+    try:
+        base = Path(get_astrbot_plugin_data_path())
+    except Exception:  # noqa: BLE001
+        return None
+    return base / _PLUGIN_NAME / _POOL_DIR_NAME
 
 
 def get_synth_semaphore(limit: Any) -> asyncio.Semaphore:
@@ -1102,6 +1209,11 @@ class CoeiroinkTTSPlugin(Star):
         self._synth_cache: OrderedDict[tuple[Any, ...], str] = OrderedDict()
         # 句级缓存：按「句子」复用音频，长文本只合成未命中的句子后拼接为一条语音
         self._phrase_cache: OrderedDict[tuple[Any, ...], str] = OrderedDict()
+        # 命中统计（键 -> {hits, ts, text, path}）：供长期池复审晋升使用
+        self._usage: dict[tuple[Any, ...], dict[str, Any]] = {}
+        # 长期保留池（键 -> {path, text, hits, last_used, promoted_at}），落盘 index.json
+        self._pool: dict[tuple[Any, ...], dict[str, Any]] = {}
+        self._pool_task: asyncio.Task | None = None
 
     # ---------------- 配置 ----------------
 
@@ -1114,6 +1226,9 @@ class CoeiroinkTTSPlugin(Star):
         if self._cfg("auto_start_engine"):
             self._warmup_task = asyncio.create_task(self._warm_up_engine())
         self._cleanup_task = asyncio.create_task(self._temp_cleanup_loop())
+        if self._pool_enabled():
+            self._pool_load_index()
+            self._pool_task = asyncio.create_task(self._pool_review_loop())
         self._register_llm_tools_if_needed()
         self._register_web_apis()
 
@@ -1122,6 +1237,8 @@ class CoeiroinkTTSPlugin(Star):
             self._warmup_task.cancel()
         if self._cleanup_task and not self._cleanup_task.done():
             self._cleanup_task.cancel()
+        if self._pool_task and not self._pool_task.done():
+            self._pool_task.cancel()
         # 释放共享 HTTP 客户端的连接池资源（重载后按需重建）
         await close_http_client()
 
@@ -1154,6 +1271,8 @@ class CoeiroinkTTSPlugin(Star):
                     pass
         if removed:
             logger.info(f"[COEIROINK] 已清理 {removed} 个过期临时音频文件")
+        # 长期池独立于临时清理：只按保留天数回收（池内音频不受 2 小时策略影响）
+        self._pool_expire()
 
     async def _temp_cleanup_loop(self) -> None:
         """后台定时清理任务：先短暂延迟清一次，之后每小时清一次。"""
@@ -1254,6 +1373,12 @@ class CoeiroinkTTSPlugin(Star):
                 f"{api}/logs", self._webui_logs, ["GET"], "引擎日志（尾部）"
             )
             self.context.register_web_api(
+                f"{api}/pool_review",
+                self._webui_pool_review,
+                ["POST"],
+                "立即复审长期保留池",
+            )
+            self.context.register_web_api(
                 f"{api}/engine_restart",
                 self._webui_engine_restart,
                 ["POST"],
@@ -1311,6 +1436,10 @@ class CoeiroinkTTSPlugin(Star):
             "style_switch_min_free_mb",
             "synth_cache_size",
             "phrase_cache_size",
+            "phrase_pool_min_hits",
+            "phrase_pool_max_entries",
+            "phrase_pool_retention_days",
+            "phrase_pool_review_hours",
         }
         float_keys = {"probability", "speedScale"}
         bool_keys = {
@@ -1325,6 +1454,8 @@ class CoeiroinkTTSPlugin(Star):
             "allow_style_override",
             "phrase_cache_enabled",
             "phrase_key_ignore_punct",
+            "phrase_pool_enabled",
+            "phrase_pool_llm_review",
         }
         # 其余键（mode/style_id/api_base/…）统一按字符串处理
 
@@ -1371,6 +1502,16 @@ class CoeiroinkTTSPlugin(Star):
                 return error_response(
                     "phrase_cache_size 必须 ≥ 0（0=禁用句级缓存）", status_code=400
                 )
+            if key == "phrase_pool_min_hits" and value < 1:
+                return error_response("phrase_pool_min_hits 必须 ≥ 1", status_code=400)
+            if key == "phrase_pool_max_entries" and value < 1:
+                return error_response("phrase_pool_max_entries 必须 ≥ 1", status_code=400)
+            if key == "phrase_pool_retention_days" and value < 0:
+                return error_response(
+                    "phrase_pool_retention_days 必须 ≥ 0（0=永久保留）", status_code=400
+                )
+            if key == "phrase_pool_review_hours" and value < 1:
+                return error_response("phrase_pool_review_hours 必须 ≥ 1", status_code=400)
             if key == "phrase_split_mode" and value not in ("sentence", "clause"):
                 return error_response(
                     "phrase_split_mode 必须是 sentence 或 clause", status_code=400
@@ -1414,6 +1555,10 @@ class CoeiroinkTTSPlugin(Star):
                 "allow_remote_engine": bool(self._cfg("allow_remote_engine")),
                 "loaded_styles": sorted(self._loaded_styles),
                 "synth_inflight": _SYNTH_INFLIGHT,
+                "pool_enabled": self._pool_enabled(),
+                "pool_entries": len(self._pool),
+                "pool_dir": str(resolve_pool_dir() or "") or None,
+                "usage_tracked": len(self._usage),
                 "engine_dir": engine_dir or None,
                 "engine_bin": resolve_engine_bin(engine_dir, self._cfg("engine_bin") or None),
                 "engine_log": resolve_engine_log(engine_dir, self._cfg("engine_log")),
@@ -1453,6 +1598,19 @@ class CoeiroinkTTSPlugin(Star):
         )
 
     # ---------------- 引擎日志 / 重启（Web UI） ----------------
+
+    async def _webui_pool_review(self):
+        """POST /pool_review：立即执行一次长期池复审（会调用 LLM，可能耗时数秒）。"""
+        if not self._webui_enabled():
+            return error_response("Web UI 管理未启用", status_code=403)
+        if not self._pool_enabled():
+            return error_response("长期保留池未启用（phrase_pool_enabled=false）", status_code=400)
+        try:
+            result = await self._pool_review_once(force_llm=True)
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"[COEIROINK] 手动复审失败：{e}")
+            return error_response(f"复审失败：{e}", status_code=500)
+        return json_response(result)
 
     async def _webui_logs(self):
         """GET /logs：返回引擎日志尾部内容（最多 _LOG_TAIL_BYTES），便于在 Web UI 排障。"""
@@ -1786,13 +1944,55 @@ class CoeiroinkTTSPlugin(Star):
             bool(self._cfg("enable_mp3")),
         )
 
+    def _record_use(self, key: tuple[Any, ...], path: str) -> None:
+        """记录一次缓存命中（用于长期池复审的复频率统计）。"""
+        info = self._usage.get(key)
+        if info is None:
+            self._usage[key] = {
+                "hits": 1,
+                "ts": time.time(),
+                "text": str(key[0]),
+                "path": path,
+            }
+        else:
+            info["hits"] = int(info.get("hits", 0)) + 1
+            info["ts"] = time.time()
+            info["path"] = path
+        if len(self._usage) > _USAGE_MAX_TRACKED:
+            # 只保留最近使用的一部分，避免统计表无限增长
+            keep = sorted(self._usage.items(), key=lambda kv: kv[1].get("ts", 0), reverse=True)
+            self._usage = dict(keep[:_USAGE_MAX_TRACKED])
+
+    def _pool_lookup(self, key: tuple[Any, ...]) -> str | None:
+        """长期池命中：返回池内音频路径并累加命中统计。"""
+        entry = self._pool.get(key)
+        if not entry:
+            return None
+        path = str(entry.get("path") or "")
+        if path and os.path.isfile(path):
+            entry["hits"] = int(entry.get("hits", 0)) + 1
+            entry["last_used"] = time.time()
+            self._record_use(key, path)
+            return path
+        # 池内文件被手工删除：清理该条目并落盘
+        self._pool.pop(key, None)
+        self._pool_save_index()
+        return None
+
     def _synth_cache_get(self, key: tuple[Any, ...]) -> str | None:
-        """命中缓存时返回音频路径；文件已被临时清理时丢弃该条目。"""
+        """命中缓存时返回音频路径；文件已被临时清理时丢弃该条目。
+
+        查找顺序：**长期保留池** → 整段缓存（池内文件不受临时清理影响）。
+        """
+        pooled = self._pool_lookup(key)
+        if pooled is not None:
+            return pooled
         path = self._synth_cache.get(key)
         if not path:
             return None
         if os.path.isfile(path):
             self._synth_cache.move_to_end(key)
+            self._record_use(key, path)
             return path
         self._synth_cache.pop(key, None)
         return None
@@ -1817,13 +2017,17 @@ class CoeiroinkTTSPlugin(Star):
         return sentence
 
     def _phrase_cache_get(self, sentence: str, style_id: int) -> str | None:
-        """按句查缓存；文件已被临时清理时丢弃该条目。"""
+        """按句查缓存（长期池优先）；文件已被临时清理时丢弃该条目。"""
         key = self._synth_cache_key(self._phrase_cache_lookup_key(sentence), style_id)
+        pooled = self._pool_lookup(key)
+        if pooled is not None:
+            return pooled
         path = self._phrase_cache.get(key)
         if not path:
             return None
         if os.path.isfile(path):
             self._phrase_cache.move_to_end(key)
+            self._record_use(key, path)
             return path
         self._phrase_cache.pop(key, None)
         return None
@@ -1838,6 +2042,271 @@ class CoeiroinkTTSPlugin(Star):
         self._phrase_cache.move_to_end(key)
         while len(self._phrase_cache) > max_size:
             self._phrase_cache.popitem(last=False)
+
+    # ---------------- 长期保留池（分层治理 + LLM 复审） ----------------
+
+    def _pool_enabled(self) -> bool:
+        return bool(self._cfg("phrase_pool_enabled"))
+
+    def _pool_save_index(self) -> bool:
+        """把长期池索引写入插件数据目录（index.json）。"""
+        pool_dir = resolve_pool_dir()
+        if pool_dir is None:
+            return False
+        try:
+            pool_dir.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "version": 1,
+                "saved_at": time.time(),
+                "entries": [
+                    {
+                        "key": synth_key_to_json(key),
+                        "path": str(info.get("path") or ""),
+                        "text": str(info.get("text") or ""),
+                        "hits": int(info.get("hits", 0)),
+                        "last_used": float(info.get("last_used") or 0.0),
+                        "promoted_at": float(info.get("promoted_at") or 0.0),
+                    }
+                    for key, info in self._pool.items()
+                ],
+            }
+            (pool_dir / _POOL_INDEX_NAME).write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            return True
+        except OSError as e:
+            logger.warning(f"[COEIROINK] 长期池索引写入失败：{e}")
+            return False
+
+    def _pool_load_index(self) -> int:
+        """启动时载入长期池索引（文件已丢失的条目会被跳过）。"""
+        pool_dir = resolve_pool_dir()
+        if pool_dir is None:
+            return 0
+        index_path = pool_dir / _POOL_INDEX_NAME
+        try:
+            if not index_path.is_file():
+                return 0
+            payload = json.loads(index_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            logger.warning(f"[COEIROINK] 长期池索引读取失败：{e}")
+            return 0
+        loaded = 0
+        entries = payload.get("entries") if isinstance(payload, dict) else None
+        for item in entries or []:
+            if not isinstance(item, dict):
+                continue
+            key = synth_key_from_json(item.get("key"))
+            path = str(item.get("path") or "")
+            if key is None or not path or not os.path.isfile(path):
+                continue
+            self._pool[key] = {
+                "path": path,
+                "text": str(item.get("text") or key[0]),
+                "hits": int(item.get("hits", 0) or 0),
+                "last_used": float(item.get("last_used", 0) or 0),
+                "promoted_at": float(item.get("promoted_at", 0) or 0),
+            }
+            loaded += 1
+        if loaded:
+            logger.info(f"[COEIROINK] 长期保留池已载入 {loaded} 条（{pool_dir}）")
+        return loaded
+
+    def _pool_candidates(self) -> list[dict[str, Any]]:
+        """按复频率筛出可晋升候选：命中数达标、文件仍在、尚未在池内。"""
+        min_hits = max(1, int(self._cfg("phrase_pool_min_hits") or 3))
+        items: list[dict[str, Any]] = []
+        for key, info in self._usage.items():
+            if key in self._pool:
+                continue
+            hits = int(info.get("hits", 0))
+            if hits < min_hits:
+                continue
+            path = str(info.get("path") or "")
+            if not path or not os.path.isfile(path):
+                continue
+            items.append(
+                {
+                    "key": key,
+                    "text": str(info.get("text") or key[0]),
+                    "hits": hits,
+                    "path": path,
+                }
+            )
+        items.sort(key=lambda x: (-x["hits"], len(x["text"])))
+        return items[:_POOL_MAX_CANDIDATES]
+
+    def _pool_promote(self, candidate: dict[str, Any]) -> bool:
+        """把候选音频复制进长期池（不动原文件，池内副本为权威）。"""
+        pool_dir = resolve_pool_dir()
+        if pool_dir is None:
+            return False
+        key = candidate["key"]
+        src = Path(str(candidate["path"]))
+        try:
+            pool_dir.mkdir(parents=True, exist_ok=True)
+            dest = pool_dir / f"coeiroink_{uuid.uuid4().hex[:16]}{src.suffix}"
+            shutil.copy2(src, dest)
+        except OSError as e:
+            logger.warning(f"[COEIROINK] 晋升长期池失败：{e}")
+            return False
+        now = time.time()
+        self._pool[key] = {
+            "path": str(dest),
+            "text": str(candidate["text"]),
+            "hits": int(candidate["hits"]),
+            "last_used": now,
+            "promoted_at": now,
+        }
+        # 池内已有权威副本，临时缓存条目可移除，避免引用被清理的文件
+        self._synth_cache.pop(key, None)
+        self._phrase_cache.pop(key, None)
+        return True
+
+    def _pool_drop(self, key: tuple[Any, ...]) -> None:
+        entry = self._pool.pop(key, None)
+        if entry:
+            _safe_unlink(str(entry.get("path") or ""))
+
+    def _pool_enforce_limits(self) -> int:
+        """超出 `phrase_pool_max_entries` 时，按命中数/最近使用淘汰。"""
+        max_entries = max(1, int(self._cfg("phrase_pool_max_entries") or 64))
+        removed = 0
+        while len(self._pool) > max_entries:
+            key = min(
+                self._pool,
+                key=lambda k: (
+                    int(self._pool[k].get("hits", 0)),
+                    float(self._pool[k].get("last_used", 0)),
+                ),
+            )
+            self._pool_drop(key)
+            removed += 1
+        return removed
+
+    def _pool_expire(self) -> int:
+        """删除超过 `phrase_pool_retention_days` 未使用的池条目（0=永久保留）。"""
+        days = int(self._cfg("phrase_pool_retention_days") or 0)
+        if days <= 0 or not self._pool:
+            return 0
+        cutoff = time.time() - days * 86400
+        expired = [k for k, v in self._pool.items() if float(v.get("last_used") or 0) < cutoff]
+        for key in expired:
+            self._pool_drop(key)
+        if expired:
+            self._pool_save_index()
+            logger.info(f"[COEIROINK] 长期池过期清理 {len(expired)} 条")
+        return len(expired)
+
+    async def _llm_review_pool(
+        self,
+        candidates: list[dict[str, Any]],
+        pool_entries: list[tuple[tuple[Any, ...], dict[str, Any]]],
+    ) -> dict[str, Any] | None:
+        """请当前对话模型复审候选与池内条目；无可用模型或调用失败返回 None。"""
+        try:
+            provider = await self.context.get_using_provider_async(None)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[COEIROINK] 长期池复审获取对话模型失败：{e}")
+            return None
+        if provider is None:
+            return None
+        payload = {
+            "candidates": [
+                {
+                    "id": idx,
+                    "text": c["text"][:80],
+                    "hits": c["hits"],
+                    "chars": len(c["text"]),
+                }
+                for idx, c in enumerate(candidates)
+            ],
+            "pool": [
+                {
+                    "id": idx,
+                    "text": str(info.get("text") or "")[:80],
+                    "hits": int(info.get("hits", 0)),
+                }
+                for idx, (_, info) in enumerate(pool_entries)
+            ],
+            "pool_limit": max(1, int(self._cfg("phrase_pool_max_entries") or 64)),
+        }
+        try:
+            resp = await provider.text_chat(
+                prompt=json.dumps(payload, ensure_ascii=False),
+                system_prompt=_POOL_REVIEW_PROMPT,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[COEIROINK] 长期池复审调用失败：{e}")
+            return None
+        return parse_pool_review_response(str(getattr(resp, "completion_text", "") or ""))
+
+    async def _pool_review_once(self, *, force_llm: bool = False) -> dict[str, Any]:
+        """执行一次长期池复审：规则筛候选 →（可选）LLM 决策 → 晋升/淘汰 → 落盘。"""
+        result: dict[str, Any] = {
+            "enabled": self._pool_enabled(),
+            "llm_used": False,
+            "candidates": 0,
+            "promoted": 0,
+            "evicted": 0,
+            "reason": "",
+            "pool_entries": len(self._pool),
+        }
+        if not result["enabled"]:
+            return result
+        candidates = self._pool_candidates()
+        result["candidates"] = len(candidates)
+        pool_entries = list(self._pool.items())
+
+        keep_ids: list[int] | None = None
+        evict_ids: list[int] = []
+        use_llm = bool(self._cfg("phrase_pool_llm_review")) or force_llm
+        if use_llm and (candidates or pool_entries):
+            decision = await self._llm_review_pool(candidates, pool_entries)
+            if decision is not None:
+                result["llm_used"] = True
+                result["reason"] = str(decision.get("reason") or "")
+                keep_ids = list(decision.get("keep") or [])
+                evict_ids = list(decision.get("evict") or [])
+                logger.info(
+                    f"[COEIROINK] LLM 复审结果：keep={keep_ids} evict={evict_ids}"
+                    f"（{result['reason'][:60]}）"
+                )
+        if keep_ids is None:
+            # 无 LLM 或调用失败：按规则全部晋升
+            keep_ids = list(range(len(candidates)))
+
+        promoted = 0
+        for idx in keep_ids:
+            if 0 <= idx < len(candidates) and self._pool_promote(candidates[idx]):
+                promoted += 1
+        evicted = 0
+        for idx in evict_ids:
+            if 0 <= idx < len(pool_entries):
+                self._pool_drop(pool_entries[idx][0])
+                evicted += 1
+        evicted += self._pool_enforce_limits()
+        result["promoted"] = promoted
+        result["evicted"] = evicted
+        result["pool_entries"] = len(self._pool)
+        if promoted or evicted:
+            self._pool_save_index()
+            logger.info(
+                f"[COEIROINK] 长期池复审完成：晋升 {promoted}、淘汰 {evicted}，当前 {len(self._pool)} 条"
+            )
+        return result
+
+    async def _pool_review_loop(self) -> None:
+        """后台复审循环：先等待一段启动缓冲，之后按 `phrase_pool_review_hours` 周期执行。"""
+        await asyncio.sleep(_POOL_REVIEW_FIRST_DELAY)
+        while True:
+            try:
+                if self._pool_enabled():
+                    await self._pool_review_once()
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"[COEIROINK] 长期池复审异常：{e}")
+            hours = max(1, int(self._cfg("phrase_pool_review_hours") or 24))
+            await asyncio.sleep(hours * 3600)
 
     async def _concat_audio(self, paths: list[str]) -> str | None:
         """把多段音频拼接为一条（ffmpeg concat demuxer + 重编码）。
