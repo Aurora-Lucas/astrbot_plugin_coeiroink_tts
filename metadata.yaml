@@ -2,7 +2,7 @@ name: astrbot_plugin_coeiroink_tts
 display_name: Tsukuyomi-chan COEIROINK 日语语音
 short_desc: 免费、隐私安全的本地 TTS：月读酱 COEIROINK 日语语音，内置图形化管理面板与安装向导。
 desc: 你是否苦恼使用远程TTS泄露信息？你是否苦恼使用远程TTS需要额外付费？快来试试本插件来进行本地TTS部署吧！本插件拥有较为良好的音频质量以及便捷的图形化设置，同时，由于是本地TTS服务所以完全免费！TTS引擎本身的安装还可以交给你的agent来完成。本插件使用 COEIROINK 引擎，把 AstrBot 的回复文本（必要时先由大模型翻译成日语）合成为语音，并以语音消息发出。支持总是翻译朗读、按需命令触发、概率触发、仅日语朗读四种模式，并支持 平静(れいせい)/温柔(おしとやか)/充满活力(げんき) 三种情绪风格，可在配置中设定默认风格、并按单次请求临时切换。内置 Web UI 图形化管理面板与安装向导（可开关，开启后原配置面板仅保留开关）。引擎目录、可执行文件、日志、ffmpeg 等环境相关项均可配置（配置项→环境变量→自动推导），不绑定具体机器。可联动 NapCat 使用 QQ 语音；其他渠道暂未测试，欢迎提交测试报告。音源：月读酱（Tsukuyomi-chan，夢前黎制作，免费音源 https://tyc.rei-yumesaki.net/）；软件：COEIROINK（シロワニさん制作，免费 TTS https://coeiroink.com/）；Logo：ノザラシ制作（https://seiga.nicovideo.jp/seiga/im11798588）。
-version: 1.5.3.1
+version: 1.5.4
 author: Aurora & deepseek
 repo: https://github.com/Aurora-Lucas/astrbot_plugin_coeiroink_tts
 support_platforms:
