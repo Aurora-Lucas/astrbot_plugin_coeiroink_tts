@@ -1,7 +1,7 @@
 # Tsukuyomi-chan COEIROINK 日语语音插件 · 结构说明（PLUGIN_STRUCTURE）
 
 > 本文档由代码实地梳理生成，只描述当前源码中**真实存在**的内容。
-> 版本：对应 `metadata.yaml` 的 `1.5.1`（v1.2.0 起插件通用化：不再内置任何机器相关路径；
+> 版本：对应 `metadata.yaml` 的 `1.5.2`（v1.2.0 起插件通用化：不再内置任何机器相关路径；
 > v1.2.1 起显示名改为 Tsukuyomi-chan COEIROINK 日语语音，并附音源/软件致谢；
 > v1.2.2 起补充 Logo 作者声明；v1.2.3 起补充渠道支持说明；
 > v1.3.0 起内置 Web UI 图形化管理面板（可开关，开启后原配置面板仅保留开关）；
@@ -11,7 +11,8 @@
 > v1.5.0 起因 AstrBot 页面 iframe 沙箱不支持跨页跳转，管理面板与安装向导合并为单页双标签，
 > 启动引擎就绪后自动切回管理面板标签；并通过 `.astrbot-plugin/i18n` 提供中文页面标题；
 > 1.5.1 起为插件市场上架补齐元数据（repo/short_desc/support_platforms/astrbot_version/tags/category），
-> 版本号改用纯语义化格式（去 `v` 前缀））。
+> 版本号改用纯语义化格式（去 `v` 前缀）；
+> 1.5.2 起以 CC BY-NC 4.0 许可协议发布（LICENSE，署名-非商业性使用，第三方资源按各自条款））。
 > 无法从代码/环境中确认的点，统一用「**待确认**」标注，不做臆测。
 
 > ### 🔊 音源与软件致谢
@@ -31,7 +32,8 @@
 /root/data/plugins/astrbot_plugin_coeiroink_tts/
 ├── README.md              # 面向用户/开发者的使用说明（四种触发模式、三种风格、内存提示）
 ├── STRUCTURE.md           # 本文件：插件结构说明
-├── metadata.yaml          # AstrBot 插件元信息（名称、显示名、版本、作者）
+├── LICENSE                # CC BY-NC 4.0（署名-非商业性使用 4.0 国际）许可全文
+├── metadata.yaml          # AstrBot 插件元信息（名称、显示名、版本、作者、市场字段）
 ├── main.py                # 插件全部逻辑（1477 行，单文件实现）
 ├── _conf_schema.json      # AstrBot 插件配置面板 schema（22 个配置项；除 enabled/enable_webui 外均 invisible，由 Web UI 管理）
 ├── _selftest_synth.py     # 独立自测脚本：绕开 AstrBot 直接调用核心合成函数
@@ -44,7 +46,7 @@
 
 | 文件 | 职责 |
 | --- | --- |
-| `metadata.yaml` | 插件标识 `name: astrbot_plugin_coeiroink_tts`、`display_name: Tsukuyomi-chan COEIROINK 日语语音`、`version: 1.5.1`、`author: 索拉`；市场字段：`repo`（GitHub 地址）、`short_desc`、`support_platforms: [aiocqhttp]`（NapCat/OneBot v11，已实测）、`astrbot_version: ">=4.28.1"`（实测版本）、`category: utilities`、`tags` |
+| `metadata.yaml` | 插件标识 `name: astrbot_plugin_coeiroink_tts`、`display_name: Tsukuyomi-chan COEIROINK 日语语音`、`version: 1.5.2`、`author: 索拉`；市场字段：`repo`（GitHub 地址）、`short_desc`、`support_platforms: [aiocqhttp]`（NapCat/OneBot v11，已实测）、`astrbot_version: ">=4.28.1"`（实测版本）、`category: utilities`、`tags` |
 | `main.py` | 全部实现：常量、默认配置、风格归一化、文本清洗、引擎探测/拉起、合成链路、翻译、TTS Provider 适配器、插件主体（自动触发 + 命令 + LLM 工具） |
 | `_conf_schema.json` | 配置项定义，AstrBot 据此渲染配置面板；键名与 `main.py` 中 `DEFAULT_CONFIG` 一一对应 |
 | `README.md` | 用户文档：风格对照、配置方法、单次切换用法、非法值行为、内存提示 |
