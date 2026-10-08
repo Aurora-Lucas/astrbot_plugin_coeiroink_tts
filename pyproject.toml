@@ -1,0 +1,15 @@
+# 本文件仅用于「开发工具配置」与 CI 依赖缓存：
+# - 插件运行并不依赖它（运行依赖由 AstrBot 环境提供，插件元数据以 metadata.yaml 为准）；
+# - actions/setup-python 的 pip 缓存需要仓库内存在 pyproject.toml 或 requirements.txt。
+#
+# ruff 规则集：仅启用经典风格（E）+ pyflakes（F）+ import 排序（I）。
+# 更严格的规则族（S/BLE/UP/ASYNC/PLW）与插件的容错设计冲突
+#（广泛异常捕获、探测函数静默失败、流式落盘等均是有意为之，代码内已有注释说明），
+# 故不纳入检查范围。
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]

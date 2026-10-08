@@ -1,5 +1,11 @@
 # 更新日志（Changelog）
 
+## 1.6.2
+
+- 修复 CI：`actions/setup-python` 的 pip 缓存需要仓库内存在 `pyproject.toml`/`requirements.txt`，此前 1.6.0 的 CI 因此在初始化步骤直接失败（代码本身无问题）
+- 新增 `pyproject.toml` 承载 ruff 配置（替代 `ruff.toml`），同时满足 CI 依赖缓存条件
+- STRUCTURE 目录树同步
+
 ## 1.6.1
 
 - Web UI：「管理面板」标签页移除重复的“测试合成”区块，只保留「安装向导」标签页第 5 步的合成验证（两个按钮不再与区块贴得过近）
