@@ -183,5 +183,33 @@
         "type": "bool",
         "default": false,
         "invisible": true
+    },
+    "max_synth_queue": {
+        "description": "合成排队上限",
+        "hint": "在途（含等待）合成数超过「并发上限 + 本值」时，新请求直接跳过，避免忙时语音延迟无限增长。默认 2；0 表示只允许并发上限内的请求。",
+        "type": "int",
+        "default": 2,
+        "invisible": true
+    },
+    "max_synth_segments": {
+        "description": "长文本最大分段数",
+        "hint": "关闭「超长文本跳过」后，长回复按句切分朗读的最大段数（每段不超过 max_text_length）。默认 6，段越多耗时越长。",
+        "type": "int",
+        "default": 6,
+        "invisible": true
+    },
+    "allow_style_override": {
+        "description": "允许单次风格切换",
+        "hint": "关闭后，命令 /voice [风格] 与 LLM 工具的 style 参数将被拒绝（只使用配置的默认风格）。引擎对每个风格懒加载且常驻内存，内存小的机器建议关闭。",
+        "type": "bool",
+        "default": true,
+        "invisible": true
+    },
+    "style_switch_min_free_mb": {
+        "description": "风格切换内存门槛 (MB)",
+        "hint": "临时切换到「尚未加载」的风格前，检查可用内存；低于该值则拒绝本次切换（避免多加载一份常驻风格导致 OOM）。0 表示不检查。默认 800。",
+        "type": "int",
+        "default": 800,
+        "invisible": true
     }
 }

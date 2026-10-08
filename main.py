@@ -88,8 +88,15 @@ _TEMP_CLEAN_FIRST_DELAY = 60.0  # 启动后首次清理的延迟（秒）
 _TEMP_CLEAN_INTERVAL = 3600.0  # 清理周期（秒）
 _TEMP_RETENTION = 2 * 3600.0  # 保留时长（秒），发送后平台可能仍需短暂持有文件
 
-# 长文本分段合成（P1-2）：最多合成段数，防止超长回复拖垮回复时效
+# 长文本分段合成（P1-2）：默认最多合成段数（可被配置 max_synth_segments 覆盖）
 _MAX_SYNTH_SEGMENTS = 6
+
+# 合成排队上限：在途（含等待）合成数超过 并发上限 + max_synth_queue 时直接跳过，
+# 避免忙时合成请求无限排队、回复延迟持续增长
+_SYNTH_INFLIGHT = 0
+
+# 引擎日志尾读上限（Web UI「引擎日志」用）
+_LOG_TAIL_BYTES = 64 * 1024
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "enabled": True,
@@ -106,6 +113,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "max_text_length": 200,
     "skip_if_too_long": True,
     "max_concurrent_synth": 1,
+    "max_synth_queue": 2,
+    "max_synth_segments": _MAX_SYNTH_SEGMENTS,
+    "allow_style_override": True,
+    "style_switch_min_free_mb": 800,
     "allow_remote_engine": False,
     "api_base": DEFAULT_API_BASE,
     "speaker_uuid": DEFAULT_SPEAKER_UUID,
@@ -1007,6 +1018,8 @@ class CoeiroinkTTSPlugin(Star):
         self._warmup_task: asyncio.Task | None = None
         self._cleanup_task: asyncio.Task | None = None
         self._bg_tasks: set[asyncio.Task] = set()
+        # 已由引擎加载（常驻内存）的风格集合；用于单次风格切换的内存保护
+        self._loaded_styles: set[int] = set()
 
     # ---------------- 配置 ----------------
 
@@ -1155,6 +1168,15 @@ class CoeiroinkTTSPlugin(Star):
                 ["POST"],
                 "安装向导：后台启动引擎",
             )
+            self.context.register_web_api(
+                f"{api}/logs", self._webui_logs, ["GET"], "引擎日志（尾部）"
+            )
+            self.context.register_web_api(
+                f"{api}/engine_restart",
+                self._webui_engine_restart,
+                ["POST"],
+                "重启引擎（仅限插件拉起的进程）",
+            )
         except Exception as e:  # noqa: BLE001
             logger.error(f"[COEIROINK] 注册 Web UI 接口失败：{e}")
 
@@ -1202,6 +1224,9 @@ class CoeiroinkTTSPlugin(Star):
             "max_text_length",
             "output_sampling_rate",
             "max_concurrent_synth",
+            "max_synth_queue",
+            "max_synth_segments",
+            "style_switch_min_free_mb",
         }
         float_keys = {"probability", "speedScale"}
         bool_keys = {
@@ -1213,6 +1238,7 @@ class CoeiroinkTTSPlugin(Star):
             "skip_if_too_long",
             "enable_webui",
             "allow_remote_engine",
+            "allow_style_override",
         }
         # 其余键（mode/style_id/api_base/…）统一按字符串处理
 
@@ -1247,6 +1273,12 @@ class CoeiroinkTTSPlugin(Star):
                 )
             if key == "max_concurrent_synth" and value < 1:
                 return error_response("max_concurrent_synth 必须 ≥ 1", status_code=400)
+            if key == "max_synth_queue" and value < 0:
+                return error_response("max_synth_queue 必须 ≥ 0", status_code=400)
+            if key == "max_synth_segments" and value < 1:
+                return error_response("max_synth_segments 必须 ≥ 1", status_code=400)
+            if key == "style_switch_min_free_mb" and value < 0:
+                return error_response("style_switch_min_free_mb 必须 ≥ 0", status_code=400)
             updated[key] = value
 
         if not updated:
@@ -1284,6 +1316,8 @@ class CoeiroinkTTSPlugin(Star):
                 "api_base": api_base,
                 "api_base_local": api_base_is_local(api_base),
                 "allow_remote_engine": bool(self._cfg("allow_remote_engine")),
+                "loaded_styles": sorted(self._loaded_styles),
+                "synth_inflight": _SYNTH_INFLIGHT,
                 "engine_dir": engine_dir or None,
                 "engine_bin": resolve_engine_bin(engine_dir, self._cfg("engine_bin") or None),
                 "engine_log": resolve_engine_log(engine_dir, self._cfg("engine_log")),
@@ -1319,6 +1353,97 @@ class CoeiroinkTTSPlugin(Star):
                 "style_id": style_id,
                 "style_label": style_label(style_id),
                 "file": path,
+            }
+        )
+
+    # ---------------- 引擎日志 / 重启（Web UI） ----------------
+
+    async def _webui_logs(self):
+        """GET /logs：返回引擎日志尾部内容（最多 _LOG_TAIL_BYTES），便于在 Web UI 排障。"""
+        engine_dir = resolve_engine_dir(self._cfg("engine_dir"))
+        log_path = resolve_engine_log(engine_dir, self._cfg("engine_log"))
+        info: dict[str, Any] = {
+            "path": log_path,
+            "exists": bool(log_path and os.path.isfile(log_path)),
+            "content": "",
+            "truncated": False,
+            "tail_bytes": _LOG_TAIL_BYTES,
+        }
+        if info["exists"]:
+            try:
+                with open(log_path, "rb") as f:  # type: ignore[arg-type]
+                    f.seek(0, os.SEEK_END)
+                    size = f.tell()
+                    read_size = min(size, _LOG_TAIL_BYTES)
+                    f.seek(max(0, size - read_size))
+                    data = f.read(read_size)
+                info["truncated"] = size > read_size
+                info["size_bytes"] = size
+                info["content"] = data.decode("utf-8", "ignore")
+            except OSError as e:
+                info["error"] = str(e)
+        return json_response(info)
+
+    async def _stop_engine_process(self, timeout: float = 15.0) -> bool:
+        """停止由插件拉起的引擎进程（先 SIGTERM，超时后 SIGKILL）。
+
+        仅处理 `_ENGINE_PROCESS` 记录的进程；外部启动的引擎不会被触碰。
+        """
+        proc = _ENGINE_PROCESS
+        if proc is None or proc.poll() is not None:
+            return False
+        try:
+            proc.terminate()
+        except OSError as e:
+            logger.warning(f"[COEIROINK] 终止引擎进程失败：{e}")
+            return False
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(1.0, timeout)
+        while loop.time() < deadline:
+            if proc.poll() is not None:
+                return True
+            await asyncio.sleep(0.5)
+        try:
+            proc.kill()
+        except OSError as e:
+            logger.warning(f"[COEIROINK] 强杀引擎进程失败：{e}")
+        await asyncio.sleep(1.0)
+        return proc.poll() is not None
+
+    async def _webui_engine_restart(self):
+        """POST /engine_restart：重启由插件拉起的引擎。
+
+        重启是释放「已加载风格所占常驻内存」的唯一途径（引擎无卸载接口）。
+        """
+        if not self._webui_enabled():
+            return error_response("Web UI 管理未启用", status_code=403)
+        proc = _ENGINE_PROCESS
+        if proc is None or proc.poll() is not None:
+            return error_response(
+                "当前引擎不是由本插件拉起的，无法自动重启；"
+                "请在宿主机上手动重启引擎，或先由本插件（安装向导）启动后再试。",
+                status_code=400,
+            )
+        api_base = str(self._cfg("api_base") or "")
+        if not await self._stop_engine_process():
+            return error_response("引擎进程停止失败，请手动处理", status_code=500)
+        # 旧进程已退出：清掉探活缓存与风格加载记录（新引擎需重新加载风格）
+        invalidate_engine_alive_cache(api_base)
+        self._loaded_styles.clear()
+        self._spawn_background_task(
+            ensure_engine_running(
+                api_base=self._cfg("api_base"),
+                engine_dir=self._cfg("engine_dir"),
+                engine_bin=self._cfg("engine_bin") or None,
+                engine_log=self._cfg("engine_log"),
+                auto_start=True,
+                start_timeout=float(self._cfg("engine_start_timeout") or 90),
+            )
+        )
+        return json_response(
+            {
+                "ok": True,
+                "message": "已停止旧引擎并在后台重新启动，请稍候刷新状态（首次冷启动约 40~60 秒）",
             }
         )
 
@@ -1490,6 +1615,9 @@ class CoeiroinkTTSPlugin(Star):
                     f"无法识别的风格「{override}」。可用风格：{describe_styles()}；"
                     "也接受中文名与日文名。"
                 )
+            guard_err = self._style_override_guard(resolved)
+            if guard_err:
+                return None, guard_err
             return resolved, None
 
         cfg_value = self._cfg("style_id")
@@ -1502,6 +1630,41 @@ class CoeiroinkTTSPlugin(Star):
             )
             return DEFAULT_STYLE_ID, None
         return resolved, None
+
+    def _style_override_guard(self, style_id: int) -> str | None:
+        """单次风格切换的内存保护。
+
+        引擎对每个风格懒加载且**常驻内存**（无卸载接口），一次风格覆盖会永久
+        多占一份驻留内存。此处按配置拦截：
+        - `allow_style_override=false`：直接拒绝单次切换（只允许配置里的默认风格）；
+        - 目标风格尚未加载且可用内存低于 `style_switch_min_free_mb`：拒绝并提示。
+
+        返回错误提示；放行时返回 None。
+        """
+        if not self._cfg("allow_style_override"):
+            return (
+                "已禁用单次风格切换（allow_style_override=false）；"
+                f"如需其它风格请在配置中修改默认风格。可用风格：{describe_styles()}"
+            )
+        if style_id in self._loaded_styles:
+            return None
+        min_free = float(self._cfg("style_switch_min_free_mb") or 0)
+        avail = available_memory_mb()
+        if min_free and avail is not None and avail < min_free:
+            logger.warning(
+                f"[COEIROINK] 风格 {style_label(style_id)} 尚未加载，"
+                f"可用内存 {avail:.0f}MB < {min_free:.0f}MB，已拒绝本次风格切换"
+            )
+            return (
+                f"可用内存不足（{avail:.0f}MB < {min_free:.0f}MB），"
+                "已拒绝临时切换到未加载的风格；请释放内存，或调整 "
+                "style_switch_min_free_mb / allow_style_override。"
+            )
+        logger.info(
+            f"[COEIROINK] 本次将加载并常驻风格 {style_label(style_id)}"
+            "（引擎无卸载接口，内存紧张时建议只用一种风格）"
+        )
+        return None
 
     def _api_base_allowed(self) -> bool:
         """校验 api_base：默认只允许回环地址，防止回复文本外发（P2-5）。"""
@@ -1517,45 +1680,66 @@ class CoeiroinkTTSPlugin(Star):
         return False
 
     async def _synth_one(self, text: str, style_id: int) -> str | None:
-        """合成单段文本，返回音频路径；不可用时返回 None（P0-2 带并发限制）。"""
+        """合成单段文本，返回音频路径；不可用时返回 None。
+
+        - 并发限流：`max_concurrent_synth`（默认 1，串行）；
+        - 排队上限：在途（含等待）数超过 并发上限 + `max_synth_queue` 时直接跳过，
+          避免忙时请求无限堆积、语音延迟持续增长。
+        """
+        global _SYNTH_INFLIGHT
+        limit = max(1, int(self._cfg("max_concurrent_synth") or 1))
+        max_queue = max(0, int(self._cfg("max_synth_queue") or 0))
+        _SYNTH_INFLIGHT += 1
         try:
-            if not self._api_base_allowed():
-                return None
-            if not await self._ensure_engine():
-                logger.warning("[COEIROINK] 引擎不可用，跳过语音合成")
-                return None
-            sem = get_synth_semaphore(self._cfg("max_concurrent_synth"))
-            async with sem:
-                return await synthesize_with_recovery(
-                    text,
-                    ensure_kwargs={
-                        "api_base": self._cfg("api_base"),
-                        "engine_dir": self._cfg("engine_dir"),
-                        "engine_bin": self._cfg("engine_bin") or None,
-                        "engine_log": self._cfg("engine_log"),
-                        "auto_start": bool(self._cfg("auto_start_engine")),
-                        "start_timeout": float(self._cfg("engine_start_timeout") or 90),
-                    },
-                    min_available_mb=float(self._cfg("min_available_memory_mb") or 0),
-                    api_base=self._cfg("api_base"),
-                    speaker_uuid=self._cfg("speaker_uuid"),
-                    style_id=int(style_id),
-                    speed_scale=float(self._cfg("speedScale") or 1.0),
-                    output_sampling_rate=int(self._cfg("output_sampling_rate") or 0) or None,
-                    enable_mp3=bool(self._cfg("enable_mp3")),
-                    keep_temp_files=bool(self._cfg("keep_temp_files")),
-                    ffmpeg_path=self._cfg("ffmpeg_path"),
+            if _SYNTH_INFLIGHT > limit + max_queue:
+                logger.info(
+                    f"[COEIROINK] 合成队列已满（在途 {_SYNTH_INFLIGHT - 1} 条 > "
+                    f"上限 {limit + max_queue}），本次跳过语音合成"
                 )
-        except Exception as e:  # noqa: BLE001
-            logger.error(f"[COEIROINK] 合成失败（不影响正常回复）：{e}")
-            return None
+                return None
+            try:
+                if not self._api_base_allowed():
+                    return None
+                if not await self._ensure_engine():
+                    logger.warning("[COEIROINK] 引擎不可用，跳过语音合成")
+                    return None
+                sem = get_synth_semaphore(limit)
+                async with sem:
+                    path = await synthesize_with_recovery(
+                        text,
+                        ensure_kwargs={
+                            "api_base": self._cfg("api_base"),
+                            "engine_dir": self._cfg("engine_dir"),
+                            "engine_bin": self._cfg("engine_bin") or None,
+                            "engine_log": self._cfg("engine_log"),
+                            "auto_start": bool(self._cfg("auto_start_engine")),
+                            "start_timeout": float(self._cfg("engine_start_timeout") or 90),
+                        },
+                        min_available_mb=float(self._cfg("min_available_memory_mb") or 0),
+                        api_base=self._cfg("api_base"),
+                        speaker_uuid=self._cfg("speaker_uuid"),
+                        style_id=int(style_id),
+                        speed_scale=float(self._cfg("speedScale") or 1.0),
+                        output_sampling_rate=int(self._cfg("output_sampling_rate") or 0) or None,
+                        enable_mp3=bool(self._cfg("enable_mp3")),
+                        keep_temp_files=bool(self._cfg("keep_temp_files")),
+                        ffmpeg_path=self._cfg("ffmpeg_path"),
+                    )
+                # 合成成功 => 该风格已被引擎加载并常驻内存
+                self._loaded_styles.add(int(style_id))
+                return path
+            except Exception as e:  # noqa: BLE001
+                logger.error(f"[COEIROINK] 合成失败（不影响正常回复）：{e}")
+                return None
+        finally:
+            _SYNTH_INFLIGHT -= 1
 
     def _segments(self, text: str) -> list[str]:
         """把待合成文本切成若干段（P1-2），返回清洗后的段列表。
 
         - 未超 max_text_length：整段返回；
         - 超长且 skip_if_too_long：返回空（保持原「跳过」语义）；
-        - 超长且允许：按句切分，段数超过 _MAX_SYNTH_SEGMENTS 时截断并记日志。
+        - 超长且允许：按句切分，段数超过 `max_synth_segments` 时截断并记日志。
         """
         cleaned = clean_text(text)
         if not cleaned:
@@ -1566,13 +1750,14 @@ class CoeiroinkTTSPlugin(Star):
         if self._cfg("skip_if_too_long"):
             logger.info(f"[COEIROINK] 文本超过 {max_len} 字，且 skip_if_too_long 开启，跳过合成")
             return []
+        max_segments = max(1, int(self._cfg("max_synth_segments") or _MAX_SYNTH_SEGMENTS))
         segments = split_text_segments(cleaned, max_len)
-        if len(segments) > _MAX_SYNTH_SEGMENTS:
+        if len(segments) > max_segments:
             logger.info(
                 f"[COEIROINK] 文本过长（{len(cleaned)} 字，切出 {len(segments)} 段），"
-                f"仅朗读前 {_MAX_SYNTH_SEGMENTS} 段"
+                f"仅朗读前 {max_segments} 段"
             )
-            segments = segments[:_MAX_SYNTH_SEGMENTS]
+            segments = segments[:max_segments]
         return segments
 
     async def _synthesize_all(self, text: str, style_id: int) -> list[str]:
@@ -1660,7 +1845,7 @@ class CoeiroinkTTSPlugin(Star):
         if not paths:
             return
         for path in paths:
-            result.chain.append(Record(file=path, url=path, text=speak_text))
+            result.chain.append(Record.fromFileSystem(path, text=speak_text))
 
     # ---------------- 按需触发（命令） ----------------
 
@@ -1701,7 +1886,7 @@ class CoeiroinkTTSPlugin(Star):
         if not paths:
             yield event.plain_result("语音合成失败：引擎不可用或文本为空。")
             return
-        yield event.chain_result([Record(file=p, url=p, text=jp) for p in paths])
+        yield event.chain_result([Record.fromFileSystem(p, text=jp) for p in paths])
 
     # ---------------- 按需触发（LLM 工具） ----------------
 
@@ -1726,5 +1911,5 @@ class CoeiroinkTTSPlugin(Star):
         paths = await self._synthesize_all(jp, style_id)
         if not paths:
             return "语音合成失败：引擎不可用或文本为空。"
-        await event.send(MessageChain([Record(file=p, url=p, text=jp) for p in paths]))
+        await event.send(MessageChain([Record.fromFileSystem(p, text=jp) for p in paths]))
         return "已发送语音。"

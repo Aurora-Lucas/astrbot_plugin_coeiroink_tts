@@ -1,7 +1,7 @@
 # Tsukuyomi-chan COEIROINK 日语语音插件 · 结构说明（PLUGIN_STRUCTURE）
 
 > 本文档由代码实地梳理生成，只描述当前源码中**真实存在**的内容。
-> 版本：对应 `metadata.yaml` 的 `1.6.2`（v1.2.0 起插件通用化：不再内置任何机器相关路径；
+> 版本：对应 `metadata.yaml` 的 `1.7.0`（v1.2.0 起插件通用化：不再内置任何机器相关路径；
 > v1.2.1 起显示名改为 Tsukuyomi-chan COEIROINK 日语语音，并附音源/软件致谢；
 > v1.2.2 起补充 Logo 作者声明；v1.2.3 起补充渠道支持说明；
 > v1.3.0 起内置 Web UI 图形化管理面板（可开关，开启后原配置面板仅保留开关）；
@@ -19,7 +19,9 @@
 > 版本约束放宽与 web 容错导入、长文本分段合成、概率夹取、macOS 内存检查、回环校验、
 > pytest/CI、ruff、logo 压缩；
 > 1.6.1 起「管理面板」标签页移除重复的测试合成区块，合成验证仅保留在「安装向导」第 5 步；
-> 1.6.2 起新增 pyproject.toml（ruff 配置 + 满足 CI pip 缓存条件），修复 1.6.0 的 CI 初始化失败）。
+> 1.6.2 起新增 pyproject.toml（ruff 配置 + 满足 CI pip 缓存条件），修复 1.6.0 的 CI 初始化失败；
+> 1.7.0 起补强运行风险与可观测性：合成排队上限、风格切换内存保护、Record.fromFileSystem、
+> Web UI 引擎日志与重启引擎、分段段数可配置、行为层测试）。
 > 无法从代码/环境中确认的点，统一用「**待确认**」标注，不做臆测。
 
 > ### 🔊 音源与软件致谢
@@ -45,8 +47,9 @@
 ├── main.py                # 插件全部逻辑（1721 行，单文件实现）
 ├── _conf_schema.json      # AstrBot 插件配置面板 schema（24 个配置项；仅 5 个基础项可见，其余由 Web UI 管理）
 ├── _selftest_synth.py     # 独立自测脚本：绕开 AstrBot 直接调用核心合成函数
-├── tests/                 # pytest 单元测试（核心纯函数；加载方式同自测脚本）
-│   └── test_plugin_core.py
+├── tests/                 # pytest 单元测试（加载方式同自测脚本）
+│   ├── test_plugin_core.py      # 纯函数（风格/文本/解析链/分段/回环校验）
+│   └── test_plugin_behavior.py  # 行为层（队列上限/风格保护/分段配置/临时清理/风格记录）
 ├── pyproject.toml         # 开发工具配置（ruff 规则集）与 CI 依赖缓存标记；插件运行不依赖它
 ├── .github/workflows/ci.yml  # GitHub Actions：ruff + py_compile + pytest
 ├── pages/                 # 内置 Web UI（AstrBot 插件 Pages）
@@ -58,7 +61,7 @@
 
 | 文件 | 职责 |
 | --- | --- |
-| `metadata.yaml` | 插件标识 `name: astrbot_plugin_coeiroink_tts`、`display_name: Tsukuyomi-chan COEIROINK 日语语音`、`version: 1.6.2`、`author: Aurora & deepseek`；市场字段：`repo`（GitHub 地址）、`short_desc`、`support_platforms: [aiocqhttp]`（NapCat/OneBot v11，已实测）、`astrbot_version: ">=4.24.5,<5"`（插件 Pages 最早可用版本）、`category: utilities`、`tags` |
+| `metadata.yaml` | 插件标识 `name: astrbot_plugin_coeiroink_tts`、`display_name: Tsukuyomi-chan COEIROINK 日语语音`、`version: 1.7.0`、`author: Aurora & deepseek`；市场字段：`repo`（GitHub 地址）、`short_desc`、`support_platforms: [aiocqhttp]`（NapCat/OneBot v11，已实测）、`astrbot_version: ">=4.24.5,<5"`（插件 Pages 最早可用版本）、`category: utilities`、`tags` |
 | `main.py` | 全部实现：常量、默认配置、风格归一化、文本清洗、引擎探测/拉起、合成链路、翻译、TTS Provider 适配器、插件主体（自动触发 + 命令 + LLM 工具） |
 | `_conf_schema.json` | 配置项定义，AstrBot 据此渲染配置面板；键名与 `main.py` 中 `DEFAULT_CONFIG` 一一对应 |
 | `README.md` | 用户文档：风格对照、配置方法、单次切换用法、非法值行为、内存提示 |
@@ -86,7 +89,9 @@
 - `_SYNTH_SEMAPHORES` + `get_synth_semaphore(limit)`：**合成并发控制**（P0-2），按并发上限复用进程内 `asyncio.Semaphore`（默认 1，串行）
 - 临时音频清理常量（P0-3）：`_TEMP_CLEAN_FIRST_DELAY=60s` / `_TEMP_CLEAN_INTERVAL=3600s` / `_TEMP_RETENTION=2h`
 - `_MAX_SYNTH_SEGMENTS = 6`：长文本分段合成的段数上限（P1-2）
-- `DEFAULT_CONFIG`：插件默认配置字典（键与 `_conf_schema.json` 对应，共 24 项；含 `enable_webui`、`max_concurrent_synth`、`allow_remote_engine`）
+- `_SYNTH_INFLIGHT`：进程内在途（含等待）合成计数，配合 `max_synth_queue` 实现排队上限
+- `_LOG_TAIL_BYTES = 64 * 1024`：Web UI 引擎日志尾读上限
+- `DEFAULT_CONFIG`：插件默认配置字典（键与 `_conf_schema.json` 对应，共 28 项；含 `enable_webui`、`max_concurrent_synth`、`max_synth_queue`、`max_synth_segments`、`allow_style_override`、`style_switch_min_free_mb`、`allow_remote_engine`）
 - 通用解析函数（环境相关路径统一走「配置项 → 环境变量 → 自动推导」）：
   - `resolve_engine_dir(cfg) -> str`：引擎根目录（配置 > `COEIROINK_ENGINE_DIR`）
   - `resolve_engine_bin(engine_dir, cfg) -> str | None`：引擎可执行文件（配置/环境变量 > `<engine_dir>/engine/engine`，Windows 为 `engine.exe`；相对路径按相对引擎目录解释）
@@ -146,20 +151,24 @@
 - `_register_llm_tools_if_needed()`：幂等注册 LLM 工具 `coeiroink_speak`（仅当 `enable_llm_tool` 为真）
 - `_ensure_engine()`：按配置调用 `ensure_engine_running`
 - `_resolve_style(override) -> (style_id, error)`：决定本次合成 styleId。`override` 非空视为显式指定，非法则返回错误提示（**不回退**）；`override` 为空用配置默认值，配置非法则告警并回退 `DEFAULT_STYLE_ID`
+- `_style_override_guard(style_id) -> str | None`：**风格切换内存保护**（1.7.0）。`allow_style_override=false` 直接拒绝单次切换；目标风格未加载且可用内存 < `style_switch_min_free_mb` 时拒绝并提示；放行时记日志说明该风格将常驻内存
 - `_api_base_allowed() -> bool`：**回环校验**（P2-5）。`allow_remote_engine` 开启或 `api_base` 为回环地址时放行；否则告警并阻止合成（防止回复文本外发）
-- `_synth_one(text, style_id) -> str | None`：单段合成。校验回环 → 确保引擎 → **`get_synth_semaphore` 限流**（P0-2）→ `synthesize_with_recovery`（带 `min_available_mb` 门槛）；不可用返回 `None`
-- `_segments(text) -> list[str]`：按 `max_text_length` 决定整段/跳过/分段（P1-2）。`skip_if_too_long` 开启时超长跳过；关闭时 `split_text_segments` 切分，超过 `_MAX_SYNTH_SEGMENTS` 段截断并记日志
+- `_synth_one(text, style_id) -> str | None`：单段合成。**排队上限判定**（在途数 > 并发上限 + `max_synth_queue` 时直接跳过）→ 校验回环 → 确保引擎 → **`get_synth_semaphore` 限流** → `synthesize_with_recovery`（带 `min_available_mb` 门槛）；成功后把该风格记入 `self._loaded_styles`；不可用返回 `None`
+- `_segments(text) -> list[str]`：按 `max_text_length` 决定整段/跳过/分段（P1-2）。`skip_if_too_long` 开启时超长跳过；关闭时 `split_text_segments` 切分，超过 `max_synth_segments`（默认 6）段截断并记日志
 - `_synthesize_all(text, style_id) -> list[str]`：**分段合成**（P1-2），逐段串行调用 `_synth_one`，返回音频路径列表
 - `_synthesize(text, style_id) -> str | None`：单段合成（保持原语义：超长按配置跳过或截断），供测试合成等短文本场景使用
 - `_to_japanese(text, umo)`：调用 `translate_to_japanese`
 - **Web UI（插件 Pages）**：
   - `_webui_enabled()`：读取 `enable_webui` 配置
-  - `_register_web_apis()`：`context.register_web_api` 注册 7 条路由（前缀 `/{_PLUGIN_NAME}`，`_PLUGIN_NAME` 与 metadata 的 name 一致）：`GET/POST /config`、`GET /status`、`POST /test`、`GET /install_info`、`POST /install_check_path`、`POST /install_launch_engine`；框架对同路由同方法幂等（自动替换），热重载安全；**老版本 AstrBot 缺少 `astrbot.api.web` 或 `register_web_api` 时自动跳过（降级为无 Web UI）**（P1-1）
+  - `_register_web_apis()`：`context.register_web_api` 注册 8 条路由（前缀 `/{_PLUGIN_NAME}`，`_PLUGIN_NAME` 与 metadata 的 name 一致）：`GET/POST /config`、`GET /status`、`POST /test`、`GET /logs`（引擎日志尾部）、`POST /engine_restart`（重启引擎）、`GET /install_info`、`POST /install_check_path`、`POST /install_launch_engine`（共 8 条路由）；框架对同路由同方法幂等（自动替换），热重载安全；**老版本 AstrBot 缺少 `astrbot.api.web` 或 `register_web_api` 时自动跳过（降级为无 Web UI）**（P1-1）
   - `_save_config() -> bool`：把 `self.config` 经 `AstrBotConfig.save_config_async()` 写回配置文件（不阻塞事件循环）
   - `_webui_get_config()`：返回当前配置 + 风格/模式选项表
   - `_webui_save_config()`：只接受已知键，按 int/float/bool/str 类型收敛；`mode` 必须在 `VALID_MODES` 内、`style_id` 必须可归一化；非法值返回 400 错误响应（`astrbot.api.web` 的 `request / json_response / error_response`）
   - `_webui_status()`：引擎探活、可用内存、当前风格、引擎进程 PID、解析后的 engine_bin/ffmpeg 等
   - `_webui_test_synth()`：`enable_webui` 关闭时返回 403；否则按当前配置合成一句测试语音（已是日语则跳过翻译）
+  - `_webui_logs()`：`GET /logs` 尾读引擎日志（最多 `_LOG_TAIL_BYTES` = 64KB），返回路径/是否存在/是否截断/内容
+  - `_stop_engine_process(timeout=15s)`：停止由插件拉起的引擎（SIGTERM → 超时 SIGKILL）；**不触碰外部启动的进程**
+  - `_webui_engine_restart()`：`POST /engine_restart`。`enable_webui` 关闭时 403；非插件拉起时 400 并提示手动重启；成功后清探活缓存与 `_loaded_styles`，后台 `ensure_engine_running` 重启
   - **安装向导**：
     - `_webui_install_info()`：环境自检（`platform.platform()`、Python、ffmpeg、可用内存、候选目录磁盘剩余空间——**按文件系统 `st_dev` 去重**，同一磁盘只返回一条并合并用途标签、引擎目录/可执行文件解析与存在性、引擎探活）
     - `_webui_install_check_path()`：校验用户填写的引擎目录（解析 engine_dir/engine_bin 并检查存在性，**不保存配置**）
@@ -169,7 +178,7 @@
 ### 2.8 对外入口
 1. **自动触发** `@filter.on_decorating_result()` → `on_decorating_result(event)`
    - 仅 `always_translate / probabilistic / japanese_only` 三种模式生效（`on_demand` 直接返回）
-   - 取 `event.get_result()` 纯文本，清洗后按模式决定 `speak_text`，再把 `Record(file, url, text)` **追加**到即将发送的消息链（不改动原文本，避免重复发送）；**长文本经 `_synthesize_all` 分段后逐段追加语音**（P1-2）
+   - 取 `event.get_result()` 纯文本，清洗后按模式决定 `speak_text`，再把 `Record.fromFileSystem(path, text=...)`（官方构造：`file:///` URI + `path`）**追加**到即将发送的消息链（不改动原文本，避免重复发送）；**长文本经 `_synthesize_all` 分段后逐段追加语音**（P1-2）
    - 性能优化：`always_translate / probabilistic` 模式下，若清洗后文本已判为日语（`is_japanese`），**跳过 LLM 翻译**直接朗读（翻译提示词对日语本就要求原样输出，行为不变）
    - `probabilistic` 模式的 `probability` **夹取到 0~1**，非法值告警（P1-3）
 2. **命令** `@filter.command("voice", alias={"念", "voice"})` → `cmd_voice(event)`
@@ -215,6 +224,10 @@
 | `max_text_length` | int | `200` | 单次合成最大字数 |
 | `skip_if_too_long` | bool | `true` | 开：超长整段跳过；关：按句分段朗读（最多 6 段，段间串行合成）（P1-2） |
 | `max_concurrent_synth` | int | `1` | **并发合成上限**（P0-2）；内存小的机器保持 1 |
+| `max_synth_queue` | int | `2` | 排队上限：在途数 > 并发上限 + 本值时跳过本次合成（1.7.0） |
+| `max_synth_segments` | int | `6` | 长文本分段朗读的最大段数（1.7.0，原为硬编码） |
+| `allow_style_override` | bool | `true` | 是否允许单次风格切换；关闭后只用默认风格（1.7.0） |
+| `style_switch_min_free_mb` | int | `800` | 切换到未加载风格前的最低可用内存（1.7.0） |
 | `allow_remote_engine` | bool | `false` | 允许向非回环地址的引擎发送文本（P2-5）；默认禁止防外发 |
 | `api_base` | string | `http://127.0.0.1:50032` | 引擎 HTTP 地址；默认仅允许回环地址 |
 | `speaker_uuid` | string | `3c37646f-3881-5374-2a83-149267990abc` | 说话人 UUID（つくよみちゃん） |
@@ -296,8 +309,9 @@
 7. **临时文件**：合成产物写在 `get_astrbot_temp_path()`（本机 `/root/data/temp`），命名 `coeiroink_<hex>.wav/.mp3`；`keep_temp_files=false` 时转码后删除 wav；插件启动 60 秒后每小时清理一次超过 2 小时的 mp3/wav（P0-3）。
 8. **热重载**：TTS Provider 适配器用幂等注册逻辑，避免二次导入抛「提供商适配器已注册」。LLM 工具用 `_llm_tools_registered` 幂等标记。
 9. **命令 alias 小注**：`@filter.command("voice", alias={"念", "voice"})` 中 `alias` 集合含 `voice` 与主名重复。**待确认**：AstrBot 对重复 alias 的处理（是否告警/忽略），从代码看不影响 `/voice` 与 `/念` 使用。
-10. **回环校验（P2-5）**：`api_base` 默认必须是回环地址（`127.x`/`localhost`/`::1`），否则合成被阻止并告警；远程引擎需开启 `allow_remote_engine`。
-11. **AstrBot 版本（P1-1）**：`astrbot_version: ">=4.24.5,<5"`（插件 Pages 最早可用版本，PR #5940 于 2026-05-03 合入、v4.24.5 发布）。低于该版本时 `astrbot.api.web` 容错导入自动停用 Web UI，核心链路不受影响。
+10. **排队上限与风格保护（1.7.0）**：`max_synth_queue` 控制在途合成数（超出即跳过，防止延迟堆积）；`allow_style_override` / `style_switch_min_free_mb` 控制单次风格切换——引擎对风格懒加载且常驻、无卸载接口，**重启引擎是释放已加载风格内存的唯一途径**（Web UI 提供「重启引擎」，仅对插件拉起的进程可用）。
+11. **回环校验（P2-5）**：`api_base` 默认必须是回环地址（`127.x`/`localhost`/`::1`），否则合成被阻止并告警；远程引擎需开启 `allow_remote_engine`。
+12. **AstrBot 版本（P1-1）**：`astrbot_version: ">=4.24.5,<5"`（插件 Pages 最早可用版本，PR #5940 于 2026-05-03 合入、v4.24.5 发布）。低于该版本时 `astrbot.api.web` 容错导入自动停用 Web UI，核心链路不受影响。
 
 ---
 
