@@ -1,5 +1,25 @@
 # 更新日志（Changelog）
 
+## 1.6.0
+
+按 ROADMAP.md 评审结论实施的改进：
+
+**P0 缺陷修复**
+- 配置面板保留基础引导项（enabled / enable_webui / engine_dir / mode / style_id），未开启 Web UI 也能完成配置（P0-1）
+- 新增 `max_concurrent_synth`（默认 1）：限制并发合成，避免内存峰值叠加触发 OOM（P0-2）
+- 新增后台定时任务，自动清理临时目录中超过 2 小时的合成音频，防止磁盘无限增长（P0-3）
+
+**P1 兼容性与体验**
+- `astrbot_version` 放宽为 `>=4.24.5,<5`（插件 Pages 最早可用版本）；`astrbot.api.web` 改为容错导入，老版本自动降级为「无 Web UI」（P1-1）
+- 长文本不再整段跳过：关闭 `skip_if_too_long` 时按句分段朗读（最多 6 段，串行合成）（P1-2）
+- `probability` 夹取到 0~1，非法值告警（P1-3）
+- macOS 可用内存检查（vm_stat），内存门槛不再失效（P1-4）
+
+**P2 工程质量**
+- 新增 pytest 单元测试（风格归一化/文本工具/分段/路径解析链/回环校验/信号量）与 GitHub Actions CI（ruff + 编译 + 测试）（P2-1/P2-2）
+- logo 压缩为 256×256（119KB → 38KB）（P2-4）
+- 安全加固：默认仅允许向回环地址的引擎发送文本，新增 `allow_remote_engine` 开关（P2-5）
+
 ## 1.5.4
 
 - 修正了作者，把最初写项目的agent的名字改了

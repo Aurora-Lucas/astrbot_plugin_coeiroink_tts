@@ -116,6 +116,8 @@ COEIROINK 的推理默认会把线程数与内存池开得很大，插件在拉�
 此外，插件在合成时会把引擎返回的音频**流式落盘**（不把整段 wav 缓冲进内存），
 探活请求只做轻量判断并带 15 秒缓存（不再反复解析引擎返回的 1.2MB 图标 JSON），
 并复用 HTTP 连接池；当文本本身已是日语时，会自动跳过 LLM 翻译环节。
+合成默认**串行执行**（`max_concurrent_synth`，防止并发内存峰值叠加），
+且插件会**定时清理临时目录中超过 2 小时的音频文件**，避免磁盘无限增长。
 
 ---
 
@@ -124,7 +126,7 @@ COEIROINK 的推理默认会把线程数与内存池开得很大，插件在拉�
 | 配置项 | 说明 |
 | --- | --- |
 | `enabled` | 启用插件 |
-| `enable_webui` | 是否启用 Web UI 图形化管理（开启后其余配置项由 Web UI 管理，原配置面板仅保留开关） |
+| `enable_webui` | 是否启用 Web UI 图形化管理（开启后其余配置项由 Web UI 管理） |
 | `mode` | 触发模式：`always_translate` / `on_demand` / `probabilistic` / `japanese_only` |
 | `style_id` | 默认风格（平静/温柔/充满活力，或 0/5/6，或日文名） |
 | `speedScale` | 语速，1.0 为原速 |
@@ -132,6 +134,9 @@ COEIROINK 的推理默认会把线程数与内存池开得很大，插件在拉�
 | `enable_llm_tool` | 是否向对话模型注册 `coeiroink_speak` 工具（需重载插件生效） |
 | `min_available_memory_mb` | 合成前最低可用内存阈值，低于则跳过 |
 | `max_text_length` | 单次合成最大字数 |
+| `skip_if_too_long` | 超长文本处理：开启则整段跳过；关闭则按句分段朗读（最多 6 段） |
+| `max_concurrent_synth` | 最大并发合成数（默认 1；内存小的机器建议保持 1） |
+| `allow_remote_engine` | 允许向非回环地址的引擎发送文本（默认禁止，防止回复内容外发） |
 | `auto_start_engine` | 引擎未运行时自动后台拉起 |
 | `engine_dir` | 引擎根目录（留空则读环境变量 `COEIROINK_ENGINE_DIR`） |
 | `engine_bin` | 引擎可执行文件（留空自动取 `<engine_dir>/engine/engine`，Windows 为 `engine.exe`） |
@@ -151,8 +156,9 @@ COEIROINK 的推理默认会把线程数与内存池开得很大，插件在拉�
 2. **重载插件**；
 3. 进入插件详情页 → 打开「Pages」中的管理面板。
 
-> 开启 Web UI 后，其余配置项会从原配置面板隐藏，统一由 Web UI 管理
-> （原面板仅保留「启用插件」与「启用 Web UI 管理」两个开关，避免两处配置互相覆盖）。
+> 开启 Web UI 后，其余配置项会从原配置面板隐藏，统一由 Web UI 管理。
+> 原配置面板保留「启用插件」「启用 Web UI 管理」「触发模式」「默认风格」「引擎目录」
+> 五个基础项，保证不开 Web UI 也能完成最小配置。
 
 ### 面板功能
 
@@ -191,10 +197,13 @@ Web UI 后端接口（`context.register_web_api`，路由前缀为插件标识�
 - **`engine_bin` 支持相对路径**（相对 `engine_dir`），例如填 `engine/engine`。
 - **Windows**：引擎路径自动按 `engine.exe` 推导；拉起进程用 `DETACHED_PROCESS`
   脱离控制台；内存门槛检查改用 `GlobalMemoryStatusEx`（Linux 用 `/proc/meminfo`，
-  其他平台跳过检查）。引擎启动时设置的 `OMP/MALLOC_*` 等环境变量是 Linux 内存
-  优化项，在其他平台是无害空操作。
-- **引擎 HTTP 地址**：默认 `http://127.0.0.1:50032`（COEIROINK 引擎默认端口），
-  如需远程引擎请改 `api_base`（注意：远程引擎无法自动拉起）。
+  macOS 用 `vm_stat`，其他平台跳过检查）。引擎启动时设置的 `OMP/MALLOC_*` 等
+  环境变量是 Linux 内存优化项，在其他平台是无害空操作。
+- **引擎 HTTP 地址**：默认 `http://127.0.0.1:50032`（COEIROINK 引擎默认端口）。
+  **默认只允许回环地址**（防止回复文本外发）；如需远程引擎，请把 `api_base` 指向
+  远程地址并开启 `allow_remote_engine`（注意：远程引擎无法自动拉起）。
+- **AstrBot 版本**：要求 `>=4.24.5,<5`（插件 Pages 最早可用版本）。低于该版本时
+  插件仍可加载（Web UI 自动停用，合成链路不受影响），安装时忽略版本警告即可。
 
 ---
 

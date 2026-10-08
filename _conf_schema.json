@@ -27,8 +27,7 @@
             "概率触发",
             "仅日语朗读"
         ],
-        "default": "on_demand",
-        "invisible": true
+        "default": "on_demand"
     },
     "probability": {
         "description": "概率触发阈值",
@@ -95,7 +94,7 @@
     },
     "skip_if_too_long": {
         "description": "超长文本跳过",
-        "hint": "开启则超长直接跳过；关闭则截断到最大字数后合成。",
+        "hint": "开启则超长文本整段跳过；关闭则按句切分后分段朗读（最多 6 段，段间串行合成）。",
         "type": "bool",
         "default": true,
         "invisible": true
@@ -128,8 +127,7 @@
             "温柔（おしとやか）",
             "充满活力（げんき）"
         ],
-        "default": "0",
-        "invisible": true
+        "default": "0"
     },
     "output_sampling_rate": {
         "description": "输出采样率",
@@ -142,8 +140,7 @@
         "description": "引擎目录",
         "hint": "COEIROINK 引擎根目录（含 engine/engine 可执行文件）。留空时从环境变量 COEIROINK_ENGINE_DIR 读取；仍未配置则无法自动拉起引擎（仅影响自动启动，不影响对已在运行的引擎调用）。Linux 示例：/root/COEIROINK_LINUX_CPU_v.2.13.0；Windows 示例：C:\\COEIROINK_LINUX_CPU_v.2.13.0",
         "type": "string",
-        "default": "",
-        "invisible": true
+        "default": ""
     },
     "engine_bin": {
         "description": "引擎可执行文件",
@@ -171,6 +168,20 @@
         "hint": "把文本翻译成日语时使用的系统提示词，要求模型只输出日语译文。",
         "type": "string",
         "default": "你是一个专业的翻译引擎。请把用户给出的文本翻译成自然、口语化的日语。只输出日语译文本身，不要输出任何解释、罗马音、拼音、引号、标注或额外文字。如果原文已经是日语，则原样输出。",
+        "invisible": true
+    },
+    "max_concurrent_synth": {
+        "description": "最大并发合成数",
+        "hint": "同时进行的语音合成上限，默认 1（串行）。并发合成会让引擎内存峰值叠加，内存小的机器请保持 1。",
+        "type": "int",
+        "default": 1,
+        "invisible": true
+    },
+    "allow_remote_engine": {
+        "description": "允许远程引擎",
+        "hint": "默认仅允许向回环地址（127.0.0.1/localhost/::1）的引擎发送文本，避免回复内容外发。若引擎确实在远程主机上，开启本开关以允许。",
+        "type": "bool",
+        "default": false,
         "invisible": true
     }
 }

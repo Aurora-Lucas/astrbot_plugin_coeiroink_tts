@@ -22,14 +22,15 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 PLUGIN_DIR = Path(__file__).resolve().parent
 PLUGIN_MAIN = os.path.join(PLUGIN_DIR, "main.py")
 
 # 默认配置路径：<插件目录>/../config/astrbot_plugin_coeiroink_tts_config.json
-DEFAULT_CONFIG_PATH = PLUGIN_DIR.parent.parent / "config" / "astrbot_plugin_coeiroink_tts_config.json"
+DEFAULT_CONFIG_PATH = (
+    PLUGIN_DIR.parent.parent / "config" / "astrbot_plugin_coeiroink_tts_config.json"
+)
 
 
 def load_plugin_module():
@@ -41,11 +42,7 @@ def load_plugin_module():
 
 def load_config(config_path: str | None) -> dict:
     """加载插件运行配置；失败返回空 dict（走插件默认值/环境变量）。"""
-    path = (
-        config_path
-        or os.environ.get("ASTRBOT_PLUGIN_CONFIG")
-        or str(DEFAULT_CONFIG_PATH)
-    )
+    path = config_path or os.environ.get("ASTRBOT_PLUGIN_CONFIG") or str(DEFAULT_CONFIG_PATH)
     try:
         # 配置文件可能带 UTF-8 BOM，用 utf-8-sig 读取
         with open(path, encoding="utf-8-sig") as f:
@@ -77,9 +74,9 @@ def probe_duration(path: str) -> float | None:
         return None
     try:
         proc = subprocess.run(
-            [ffprobe, "-v", "error", "-show_entries", "format=duration",
-             "-of", "json", path],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "json", path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
         return float(json.loads(proc.stdout)["format"]["duration"])
     except Exception:  # noqa: BLE001
@@ -130,12 +127,18 @@ async def main() -> int:
         keep_temp_files=False,
     )
     size = os.path.getsize(path)
-    print(json.dumps({
-        "text": args.text,
-        "path": path,
-        "bytes": size,
-        "duration_sec": probe_duration(path),
-    }, ensure_ascii=False, indent=2))
+    print(
+        json.dumps(
+            {
+                "text": args.text,
+                "path": path,
+                "bytes": size,
+                "duration_sec": probe_duration(path),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
     return 0
 
 

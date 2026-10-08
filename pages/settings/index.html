@@ -174,7 +174,18 @@
       <div class="fgroup">
         <div class="field"><label>最低可用内存（MB，0=不检查）</label><input type="number" id="cfg_min_available_memory_mb" /></div>
         <div class="field"><label>单次合成最大字数</label><input type="number" id="cfg_max_text_length" /></div>
-        <div class="field check"><input type="checkbox" id="cfg_skip_if_too_long" /><label for="cfg_skip_if_too_long">超长文本直接跳过（否则截断）</label></div>
+        <div class="field"><label>最大并发合成数（默认 1，内存小建议保持 1）</label><input type="number" id="cfg_max_concurrent_synth" min="1" /></div>
+        <div class="field check"><input type="checkbox" id="cfg_skip_if_too_long" /><label for="cfg_skip_if_too_long">超长文本直接跳过（关闭则按句分段朗读，最多 6 段）</label></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>安全</h2>
+      <div class="fgroup">
+        <div class="field check">
+          <input type="checkbox" id="cfg_allow_remote_engine" />
+          <label for="cfg_allow_remote_engine">允许远程引擎（默认仅允许回环地址，防止回复文本外发；确认引擎在远程主机时再开启）</label>
+        </div>
       </div>
     </div>
 
@@ -356,6 +367,7 @@
     setCheckbox("cfg_enable_llm_tool", cfg.enable_llm_tool);
     setCheckbox("cfg_skip_if_too_long", cfg.skip_if_too_long);
     setCheckbox("cfg_enable_webui", cfg.enable_webui);
+    setCheckbox("cfg_allow_remote_engine", cfg.allow_remote_engine);
     setValue("cfg_mode", cfg.mode);
     setValue("cfg_probability", cfg.probability);
     setValue("cfg_speedScale", cfg.speedScale);
@@ -367,6 +379,7 @@
     setValue("cfg_engine_start_timeout", cfg.engine_start_timeout);
     setValue("cfg_min_available_memory_mb", cfg.min_available_memory_mb);
     setValue("cfg_max_text_length", cfg.max_text_length);
+    setValue("cfg_max_concurrent_synth", cfg.max_concurrent_synth);
     setValue("cfg_output_sampling_rate", cfg.output_sampling_rate);
     setValue("cfg_ffmpeg_path", cfg.ffmpeg_path);
     setValue("cfg_translate_system_prompt", cfg.translate_system_prompt);
@@ -436,6 +449,7 @@
       "enabled", "mode", "probability", "style_id", "speedScale", "enable_mp3",
       "keep_temp_files", "auto_start_engine", "enable_llm_tool", "enable_webui",
       "engine_start_timeout", "min_available_memory_mb", "max_text_length",
+      "max_concurrent_synth", "allow_remote_engine",
       "skip_if_too_long", "api_base", "speaker_uuid", "output_sampling_rate",
       "engine_dir", "engine_bin", "engine_log", "ffmpeg_path",
       "translate_system_prompt",

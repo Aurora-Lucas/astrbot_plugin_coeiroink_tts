@@ -24,15 +24,21 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
-
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import Record
 from astrbot.api.provider import ProviderType
 from astrbot.api.star import Context, Star
-from astrbot.api.web import error_response, json_response, request
+
+# 插件 Pages（Web UI）所需的 web 助手只在较新版本的 AstrBot 中提供。
+# 容错导入：老版本 AstrBot 下自动降级为「无 Web UI」，核心合成链路不受影响。
+try:
+    from astrbot.api.web import error_response, json_response, request
+except ImportError:  # pragma: no cover - 仅老版本 AstrBot 触发
+    error_response = json_response = request = None  # type: ignore[assignment]
 from astrbot.core.agent.tool import FunctionTool
 from astrbot.core.provider.provider import TTSProvider
 from astrbot.core.provider.register import register_provider_adapter
@@ -74,6 +80,17 @@ _PLUGIN_NAME = "astrbot_plugin_coeiroink_tts"
 _ENGINE_START_LOCK = asyncio.Lock()
 _ENGINE_PROCESS: "subprocess.Popen[bytes] | None" = None
 
+# 合成并发控制（P0-2）：按并发上限复用信号量，避免并发请求叠加引擎内存峰值
+_SYNTH_SEMAPHORES: dict[int, asyncio.Semaphore] = {}
+
+# 临时音频清理（P0-3）：定期删除过期产物，防止磁盘无限增长
+_TEMP_CLEAN_FIRST_DELAY = 60.0  # 启动后首次清理的延迟（秒）
+_TEMP_CLEAN_INTERVAL = 3600.0  # 清理周期（秒）
+_TEMP_RETENTION = 2 * 3600.0  # 保留时长（秒），发送后平台可能仍需短暂持有文件
+
+# 长文本分段合成（P1-2）：最多合成段数，防止超长回复拖垮回复时效
+_MAX_SYNTH_SEGMENTS = 6
+
 DEFAULT_CONFIG: dict[str, Any] = {
     "enabled": True,
     "mode": "on_demand",
@@ -88,6 +105,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "min_available_memory_mb": 500,
     "max_text_length": 200,
     "skip_if_too_long": True,
+    "max_concurrent_synth": 1,
+    "allow_remote_engine": False,
     "api_base": DEFAULT_API_BASE,
     "speaker_uuid": DEFAULT_SPEAKER_UUID,
     "style_id": DEFAULT_STYLE_ID,
@@ -98,6 +117,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "ffmpeg_path": DEFAULT_FFMPEG,
     "translate_system_prompt": DEFAULT_TRANSLATE_PROMPT,
 }
+
+
+def get_synth_semaphore(limit: Any) -> asyncio.Semaphore:
+    """按并发上限复用进程内信号量（P0-2）。"""
+    n = max(1, int(limit or 1))
+    sem = _SYNTH_SEMAPHORES.get(n)
+    if sem is None:
+        sem = _SYNTH_SEMAPHORES[n] = asyncio.Semaphore(n)
+    return sem
 
 
 # ---------------------------------------------------------------------------
@@ -271,7 +299,7 @@ _URL_RE = re.compile(r"https?://\S+")
 _FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
 # 去掉常见 Markdown 标记与控制字符，但保留中日常用标点
 _MD_RE = re.compile(r"[*_`~#>\[\]()]|!\[[^\]]*\]")
-_EMOJI_RE = re.compile("[\U0001F000-\U0001FAFF\u200d\ufe0f\u2600-\u26ff]")
+_EMOJI_RE = re.compile("[\U0001f000-\U0001faff\u200d\ufe0f\u2600-\u26ff]")
 
 
 def clean_text(text: str) -> str:
@@ -298,6 +326,59 @@ def is_japanese(text: str) -> bool:
     if kana == 0:
         return False
     return (kana / len(meaningful)) >= 0.1
+
+
+_SENT_ENDERS_RE = re.compile(r"(?<=[。！？!?…])")
+
+
+def split_text_segments(text: str, max_len: int) -> list[str]:
+    """把长文本按句末标点（。！？!?…）切分成不超过 max_len 的段落（P1-2）。
+
+    - 先按句末标点切句（标点保留在句尾）；
+    - 贪心合并短句，使每段尽量接近但不超 max_len；
+    - 单句仍超长时按 max_len 硬切为多段，不丢弃内容。
+    """
+    if not text:
+        return []
+    max_len = max(1, int(max_len))
+    if len(text) <= max_len:
+        return [text]
+    sentences = [s for s in _SENT_ENDERS_RE.split(text) if s]
+    if not sentences:
+        return [text[i : i + max_len] for i in range(0, len(text), max_len)]
+
+    segments: list[str] = []
+    buf = ""
+    for s in sentences:
+        if len(s) > max_len:
+            if buf:
+                segments.append(buf)
+                buf = ""
+            segments.extend(s[i : i + max_len] for i in range(0, len(s), max_len))
+            continue
+        if buf and len(buf) + len(s) > max_len:
+            segments.append(buf)
+            buf = s
+        else:
+            buf += s
+    if buf:
+        segments.append(buf)
+    return segments
+
+
+# 回环主机名（P2-5）：默认只允许向本机引擎发送待朗读文本，防止内容外发
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def api_base_is_local(api_base: str) -> bool:
+    """判断引擎地址是否为回环地址。解析失败视为非本地（保守拒绝）。"""
+    try:
+        host = (urlparse(str(api_base or "")).hostname or "").lower()
+    except ValueError:
+        return False
+    if not host:
+        return False
+    return host in _LOOPBACK_HOSTS or host.startswith("127.")
 
 
 # ---------------------------------------------------------------------------
@@ -439,10 +520,9 @@ def _launch_engine(engine_dir: str, engine_bin: str, engine_log: str | None) -> 
     }
     if os.name == "nt":
         # Windows：脱离当前控制台/进程组，避免随 AstrBot 退出被带走
-        popen_kwargs["creationflags"] = (
-            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-            | getattr(subprocess, "DETACHED_PROCESS", 0)
-        )
+        popen_kwargs["creationflags"] = getattr(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+        ) | getattr(subprocess, "DETACHED_PROCESS", 0)
     else:
         popen_kwargs["start_new_session"] = True
 
@@ -560,9 +640,7 @@ async def stream_wav_to_path(
                 invalidate_engine_alive_cache(base)
                 _safe_unlink(wav_path)
                 raise
-            logger.warning(
-                f"[COEIROINK] 合成请求被引擎断开（{e}），{retry_wait}s 后重试一次"
-            )
+            logger.warning(f"[COEIROINK] 合成请求被引擎断开（{e}），{retry_wait}s 后重试一次")
             await asyncio.sleep(retry_wait)
         except httpx.HTTPStatusError:
             _safe_unlink(wav_path)
@@ -690,11 +768,36 @@ def _available_memory_windows_mb() -> float | None:
     return None
 
 
+def _available_memory_macos_mb() -> float | None:
+    """macOS：解析 vm_stat 的 free+inactive 页 × 页大小（MB）。失败返回 None。"""
+    try:
+        vm = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5).stdout
+        free_pages = inactive_pages = 0
+        for line in vm.splitlines():
+            key, _, val = line.partition(":")
+            key = key.strip().lower()
+            if key == "pages free":
+                free_pages = int(val.strip().rstrip("."))
+            elif key == "pages inactive":
+                inactive_pages = int(val.strip().rstrip("."))
+        page_size = int(
+            subprocess.run(
+                ["sysctl", "-n", "hw.pagesize"], capture_output=True, text=True, timeout=5
+            ).stdout.strip()
+        )
+        if page_size > 0 and (free_pages or inactive_pages):
+            return (free_pages + inactive_pages) * page_size / 1048576.0
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
 def available_memory_mb() -> float | None:
     """读取当前系统可用内存（单位 MB）。
 
     Linux 读 /proc/meminfo 的 MemAvailable；Windows 用
-    GlobalMemoryStatusEx；其他平台或读取失败返回 None（跳过内存门槛检查）。
+    GlobalMemoryStatusEx；macOS 用 vm_stat（free+inactive 页）；
+    其他平台或读取失败返回 None（跳过内存门槛检查，不阻断合成）。
     """
     try:
         with open("/proc/meminfo", encoding="ascii") as f:
@@ -705,6 +808,8 @@ def available_memory_mb() -> float | None:
         pass
     if os.name == "nt":
         return _available_memory_windows_mb()
+    if sys.platform == "darwin":
+        return _available_memory_macos_mb()
     return None
 
 
@@ -786,9 +891,7 @@ class CoeiroinkTTSProvider(TTSProvider):
             _resolved_style = DEFAULT_STYLE_ID
         self.style_id = _resolved_style
         self.speed_scale = float(provider_config.get("speed_scale", 1.0) or 1.0)
-        self.output_sampling_rate = int(
-            provider_config.get("output_sampling_rate", 0) or 0
-        )
+        self.output_sampling_rate = int(provider_config.get("output_sampling_rate", 0) or 0)
         self.enable_mp3 = bool(provider_config.get("enable_mp3", True))
         self.auto_start_engine = bool(provider_config.get("auto_start_engine", True))
         self.engine_dir = provider_config.get("engine_dir", DEFAULT_ENGINE_DIR)
@@ -902,6 +1005,7 @@ class CoeiroinkTTSPlugin(Star):
                     self.config[k] = v
         self._llm_tools_registered = False
         self._warmup_task: asyncio.Task | None = None
+        self._cleanup_task: asyncio.Task | None = None
         self._bg_tasks: set[asyncio.Task] = set()
 
     # ---------------- 配置 ----------------
@@ -914,12 +1018,15 @@ class CoeiroinkTTSPlugin(Star):
     async def initialize(self) -> None:
         if self._cfg("auto_start_engine"):
             self._warmup_task = asyncio.create_task(self._warm_up_engine())
+        self._cleanup_task = asyncio.create_task(self._temp_cleanup_loop())
         self._register_llm_tools_if_needed()
         self._register_web_apis()
 
     async def terminate(self) -> None:
         if self._warmup_task and not self._warmup_task.done():
             self._warmup_task.cancel()
+        if self._cleanup_task and not self._cleanup_task.done():
+            self._cleanup_task.cancel()
         # 释放共享 HTTP 客户端的连接池资源（重载后按需重建）
         await close_http_client()
 
@@ -933,6 +1040,32 @@ class CoeiroinkTTSPlugin(Star):
                 )
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[COEIROINK] 预热引擎失败（不影响正常回复）：{e}")
+
+    async def _cleanup_temp_audio(self) -> None:
+        """清理 AstrBot 临时目录中超过保留时长的合成产物（P0-3）。"""
+        try:
+            temp_dir = Path(get_astrbot_temp_path())
+        except Exception:  # noqa: BLE001
+            return
+        cutoff = time.time() - _TEMP_RETENTION
+        removed = 0
+        for pattern in ("coeiroink_*.mp3", "coeiroink_*.wav"):
+            for f in temp_dir.glob(pattern):
+                try:
+                    if f.stat().st_mtime < cutoff:
+                        f.unlink()
+                        removed += 1
+                except OSError:
+                    pass
+        if removed:
+            logger.info(f"[COEIROINK] 已清理 {removed} 个过期临时音频文件")
+
+    async def _temp_cleanup_loop(self) -> None:
+        """后台定时清理任务：先短暂延迟清一次，之后每小时清一次。"""
+        await asyncio.sleep(_TEMP_CLEAN_FIRST_DELAY)
+        while True:
+            await self._cleanup_temp_audio()
+            await asyncio.sleep(_TEMP_CLEAN_INTERVAL)
 
     def _register_llm_tools_if_needed(self) -> None:
         """幂等注册 LLM 工具，避免重复注册。"""
@@ -984,7 +1117,15 @@ class CoeiroinkTTSPlugin(Star):
 
         AstrBot 的 register_web_api 对「相同路由 + 相同方法」幂等（自动替换），
         因此插件热重载后重复调用是安全的。路由前缀必须是插件标识名。
+        老版本 AstrBot 缺少 `astrbot.api.web` 或 `register_web_api` 时自动跳过
+        （降级为无 Web UI，核心合成链路不受影响）。
         """
+        if request is None or not hasattr(self.context, "register_web_api"):
+            logger.info(
+                "[COEIROINK] 当前 AstrBot 版本不支持插件 Pages，Web UI 已停用；"
+                "配置可通过面板与配置文件管理。"
+            )
+            return
         api = f"/{_PLUGIN_NAME}"
         try:
             self.context.register_web_api(
@@ -1032,20 +1173,22 @@ class CoeiroinkTTSPlugin(Star):
 
     async def _webui_get_config(self):
         """GET /config：返回当前配置与风格/模式说明。"""
-        return json_response({
-            "enable_webui": self._webui_enabled(),
-            "config": dict(self.config),
-            "styles": [
-                {"id": sid, "label": style_label(sid), "zh": zh, "ja": ja}
-                for sid, (zh, ja) in STYLE_TABLE.items()
-            ],
-            "modes": [
-                {"value": "always_translate", "label": "总是翻译朗读"},
-                {"value": "on_demand", "label": "按需触发"},
-                {"value": "probabilistic", "label": "概率触发"},
-                {"value": "japanese_only", "label": "仅日语朗读"},
-            ],
-        })
+        return json_response(
+            {
+                "enable_webui": self._webui_enabled(),
+                "config": dict(self.config),
+                "styles": [
+                    {"id": sid, "label": style_label(sid), "zh": zh, "ja": ja}
+                    for sid, (zh, ja) in STYLE_TABLE.items()
+                ],
+                "modes": [
+                    {"value": "always_translate", "label": "总是翻译朗读"},
+                    {"value": "on_demand", "label": "按需触发"},
+                    {"value": "probabilistic", "label": "概率触发"},
+                    {"value": "japanese_only", "label": "仅日语朗读"},
+                ],
+            }
+        )
 
     async def _webui_save_config(self):
         """POST /config：校验并保存配置项（只接受已知键，按类型收敛）。"""
@@ -1054,20 +1197,24 @@ class CoeiroinkTTSPlugin(Star):
             return error_response("请求体必须是 JSON 对象", status_code=400)
 
         int_keys = {
-            "engine_start_timeout", "min_available_memory_mb",
-            "max_text_length", "output_sampling_rate",
+            "engine_start_timeout",
+            "min_available_memory_mb",
+            "max_text_length",
+            "output_sampling_rate",
+            "max_concurrent_synth",
         }
         float_keys = {"probability", "speedScale"}
         bool_keys = {
-            "enabled", "enable_mp3", "keep_temp_files",
-            "auto_start_engine", "enable_llm_tool", "skip_if_too_long",
+            "enabled",
+            "enable_mp3",
+            "keep_temp_files",
+            "auto_start_engine",
+            "enable_llm_tool",
+            "skip_if_too_long",
             "enable_webui",
+            "allow_remote_engine",
         }
-        str_keys = {
-            "mode", "style_id", "api_base", "speaker_uuid",
-            "engine_dir", "engine_bin", "engine_log", "ffmpeg_path",
-            "translate_system_prompt",
-        }
+        # 其余键（mode/style_id/api_base/…）统一按字符串处理
 
         updated: dict[str, Any] = {}
         for key, raw in payload.items():
@@ -1098,6 +1245,8 @@ class CoeiroinkTTSPlugin(Star):
                 return error_response(
                     f"无法识别的风格「{value}」。可用风格：{describe_styles()}", status_code=400
                 )
+            if key == "max_concurrent_synth" and value < 1:
+                return error_response("max_concurrent_synth 必须 ≥ 1", status_code=400)
             updated[key] = value
 
         if not updated:
@@ -1106,11 +1255,13 @@ class CoeiroinkTTSPlugin(Star):
         self.config.update(updated)
         if not await self._save_config():
             return error_response("配置已更新到内存，但写回配置文件失败", status_code=500)
-        return json_response({
-            "saved": True,
-            "changed": list(updated.keys()),
-            "config": dict(self.config),
-        })
+        return json_response(
+            {
+                "saved": True,
+                "changed": list(updated.keys()),
+                "config": dict(self.config),
+            }
+        )
 
     async def _webui_status(self):
         """GET /status：引擎探活、内存、风格等运行状态。"""
@@ -1121,22 +1272,26 @@ class CoeiroinkTTSPlugin(Star):
         if _ENGINE_PROCESS is not None and _ENGINE_PROCESS.poll() is None:
             engine_pid = _ENGINE_PROCESS.pid
         engine_dir = resolve_engine_dir(self._cfg("engine_dir"))
-        return json_response({
-            "plugin_enabled": bool(self._cfg("enabled")),
-            "webui_enabled": self._webui_enabled(),
-            "mode": self._cfg("mode"),
-            "style_id": style_id,
-            "style_label": style_label(style_id),
-            "engine_alive": alive,
-            "engine_pid": engine_pid,
-            "api_base": api_base,
-            "engine_dir": engine_dir or None,
-            "engine_bin": resolve_engine_bin(engine_dir, self._cfg("engine_bin") or None),
-            "engine_log": resolve_engine_log(engine_dir, self._cfg("engine_log")),
-            "ffmpeg": resolve_ffmpeg(self._cfg("ffmpeg_path")) or None,
-            "mem_available_mb": available_memory_mb(),
-            "min_available_memory_mb": float(self._cfg("min_available_memory_mb") or 0),
-        })
+        return json_response(
+            {
+                "plugin_enabled": bool(self._cfg("enabled")),
+                "webui_enabled": self._webui_enabled(),
+                "mode": self._cfg("mode"),
+                "style_id": style_id,
+                "style_label": style_label(style_id),
+                "engine_alive": alive,
+                "engine_pid": engine_pid,
+                "api_base": api_base,
+                "api_base_local": api_base_is_local(api_base),
+                "allow_remote_engine": bool(self._cfg("allow_remote_engine")),
+                "engine_dir": engine_dir or None,
+                "engine_bin": resolve_engine_bin(engine_dir, self._cfg("engine_bin") or None),
+                "engine_log": resolve_engine_log(engine_dir, self._cfg("engine_log")),
+                "ffmpeg": resolve_ffmpeg(self._cfg("ffmpeg_path")) or None,
+                "mem_available_mb": available_memory_mb(),
+                "min_available_memory_mb": float(self._cfg("min_available_memory_mb") or 0),
+            }
+        )
 
     async def _webui_test_synth(self):
         """POST /test：用当前配置合成一句测试语音。"""
@@ -1157,13 +1312,15 @@ class CoeiroinkTTSPlugin(Star):
         path = await self._synthesize(jp, style_id)
         if not path:
             return error_response("语音合成失败：引擎不可用或文本为空", status_code=502)
-        return json_response({
-            "ok": True,
-            "text": jp,
-            "style_id": style_id,
-            "style_label": style_label(style_id),
-            "file": path,
-        })
+        return json_response(
+            {
+                "ok": True,
+                "text": jp,
+                "style_id": style_id,
+                "style_label": style_label(style_id),
+                "file": path,
+            }
+        )
 
     # ---------------- 安装向导（Web UI） ----------------
 
@@ -1211,30 +1368,34 @@ class CoeiroinkTTSPlugin(Star):
                 usage = shutil.disk_usage(cand)
             except Exception:  # noqa: BLE001
                 continue
-            disk.append({
-                "_dev": dev,
-                "path": cand,
-                "labels": [label],
-                "total_gb": round(usage.total / 2**30, 1),
-                "free_gb": round(usage.free / 2**30, 1),
-            })
+            disk.append(
+                {
+                    "_dev": dev,
+                    "path": cand,
+                    "labels": [label],
+                    "total_gb": round(usage.total / 2**30, 1),
+                    "free_gb": round(usage.free / 2**30, 1),
+                }
+            )
         for item in disk:
             item.pop("_dev", None)
 
-        return json_response({
-            "platform": platform.platform(),
-            "os_name": os.name,
-            "python": sys.version.split()[0],
-            "ffmpeg": resolve_ffmpeg(self._cfg("ffmpeg_path")) or None,
-            "engine_dir": cfg_dir or None,
-            "engine_bin": bin_path,
-            "engine_bin_exists": bool(bin_path and os.path.isfile(bin_path)),
-            "engine_alive": await check_engine_alive(str(self._cfg("api_base") or "")),
-            "api_base": self._cfg("api_base"),
-            "mem_available_mb": available_memory_mb(),
-            "disk": disk,
-            "webui_enabled": self._webui_enabled(),
-        })
+        return json_response(
+            {
+                "platform": platform.platform(),
+                "os_name": os.name,
+                "python": sys.version.split()[0],
+                "ffmpeg": resolve_ffmpeg(self._cfg("ffmpeg_path")) or None,
+                "engine_dir": cfg_dir or None,
+                "engine_bin": bin_path,
+                "engine_bin_exists": bool(bin_path and os.path.isfile(bin_path)),
+                "engine_alive": await check_engine_alive(str(self._cfg("api_base") or "")),
+                "api_base": self._cfg("api_base"),
+                "mem_available_mb": available_memory_mb(),
+                "disk": disk,
+                "webui_enabled": self._webui_enabled(),
+            }
+        )
 
     async def _webui_install_check_path(self):
         """POST /install_check_path：校验用户填写的引擎目录（不保存配置）。
@@ -1251,13 +1412,15 @@ class CoeiroinkTTSPlugin(Star):
         resolved_dir = resolve_engine_dir(engine_dir)
         resolved_bin = resolve_engine_bin(resolved_dir, engine_bin_cfg)
         exists = bool(resolved_bin and os.path.isfile(resolved_bin))
-        return json_response({
-            "engine_dir": resolved_dir,
-            "engine_dir_exists": os.path.isdir(resolved_dir),
-            "engine_bin": resolved_bin,
-            "engine_bin_exists": exists,
-            "ok": exists,
-        })
+        return json_response(
+            {
+                "engine_dir": resolved_dir,
+                "engine_dir_exists": os.path.isdir(resolved_dir),
+                "engine_bin": resolved_bin,
+                "engine_bin_exists": exists,
+                "ok": exists,
+            }
+        )
 
     async def _webui_install_launch_engine(self):
         """POST /install_launch_engine：后台拉起引擎（不阻塞请求，前端轮询状态）。"""
@@ -1265,9 +1428,13 @@ class CoeiroinkTTSPlugin(Star):
             return error_response("Web UI 管理未启用", status_code=403)
         api_base = str(self._cfg("api_base") or "")
         if await check_engine_alive(api_base):
-            return json_response({
-                "ok": True, "already_alive": True, "message": "引擎已在运行，无需启动",
-            })
+            return json_response(
+                {
+                    "ok": True,
+                    "already_alive": True,
+                    "message": "引擎已在运行，无需启动",
+                }
+            )
         ensure_kwargs = {
             "api_base": api_base,
             "engine_dir": self._cfg("engine_dir"),
@@ -1286,11 +1453,13 @@ class CoeiroinkTTSPlugin(Star):
                 status_code=400,
             )
         self._spawn_background_task(ensure_engine_running(**ensure_kwargs))
-        return json_response({
-            "ok": True,
-            "already_alive": False,
-            "message": "已在后台启动引擎，请稍候并刷新状态（首次冷启动约需 40~60 秒）",
-        })
+        return json_response(
+            {
+                "ok": True,
+                "already_alive": False,
+                "message": "已在后台启动引擎，请稍候并刷新状态（首次冷启动约需 40~60 秒）",
+            }
+        )
 
     # ---------------- 引擎 / 合成封装 ----------------
 
@@ -1334,11 +1503,92 @@ class CoeiroinkTTSPlugin(Star):
             return DEFAULT_STYLE_ID, None
         return resolved, None
 
-    async def _synthesize(self, text: str, style_id: int) -> str | None:
-        """清理文本并合成音频，返回文件路径；不可用时返回 None。
+    def _api_base_allowed(self) -> bool:
+        """校验 api_base：默认只允许回环地址，防止回复文本外发（P2-5）。"""
+        if self._cfg("allow_remote_engine"):
+            return True
+        base = str(self._cfg("api_base") or "")
+        if api_base_is_local(base):
+            return True
+        logger.warning(
+            f"[COEIROINK] api_base={base} 不是回环地址，已阻止语音合成（防止文本外发）。"
+            "如确需使用远程引擎，请开启配置项 allow_remote_engine。"
+        )
+        return False
 
-        style_id 为本次实际使用的风格，由 _resolve_style 事先解析。
+    async def _synth_one(self, text: str, style_id: int) -> str | None:
+        """合成单段文本，返回音频路径；不可用时返回 None（P0-2 带并发限制）。"""
+        try:
+            if not self._api_base_allowed():
+                return None
+            if not await self._ensure_engine():
+                logger.warning("[COEIROINK] 引擎不可用，跳过语音合成")
+                return None
+            sem = get_synth_semaphore(self._cfg("max_concurrent_synth"))
+            async with sem:
+                return await synthesize_with_recovery(
+                    text,
+                    ensure_kwargs={
+                        "api_base": self._cfg("api_base"),
+                        "engine_dir": self._cfg("engine_dir"),
+                        "engine_bin": self._cfg("engine_bin") or None,
+                        "engine_log": self._cfg("engine_log"),
+                        "auto_start": bool(self._cfg("auto_start_engine")),
+                        "start_timeout": float(self._cfg("engine_start_timeout") or 90),
+                    },
+                    min_available_mb=float(self._cfg("min_available_memory_mb") or 0),
+                    api_base=self._cfg("api_base"),
+                    speaker_uuid=self._cfg("speaker_uuid"),
+                    style_id=int(style_id),
+                    speed_scale=float(self._cfg("speedScale") or 1.0),
+                    output_sampling_rate=int(self._cfg("output_sampling_rate") or 0) or None,
+                    enable_mp3=bool(self._cfg("enable_mp3")),
+                    keep_temp_files=bool(self._cfg("keep_temp_files")),
+                    ffmpeg_path=self._cfg("ffmpeg_path"),
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"[COEIROINK] 合成失败（不影响正常回复）：{e}")
+            return None
+
+    def _segments(self, text: str) -> list[str]:
+        """把待合成文本切成若干段（P1-2），返回清洗后的段列表。
+
+        - 未超 max_text_length：整段返回；
+        - 超长且 skip_if_too_long：返回空（保持原「跳过」语义）；
+        - 超长且允许：按句切分，段数超过 _MAX_SYNTH_SEGMENTS 时截断并记日志。
         """
+        cleaned = clean_text(text)
+        if not cleaned:
+            return []
+        max_len = int(self._cfg("max_text_length") or 200)
+        if len(cleaned) <= max_len:
+            return [cleaned]
+        if self._cfg("skip_if_too_long"):
+            logger.info(f"[COEIROINK] 文本超过 {max_len} 字，且 skip_if_too_long 开启，跳过合成")
+            return []
+        segments = split_text_segments(cleaned, max_len)
+        if len(segments) > _MAX_SYNTH_SEGMENTS:
+            logger.info(
+                f"[COEIROINK] 文本过长（{len(cleaned)} 字，切出 {len(segments)} 段），"
+                f"仅朗读前 {_MAX_SYNTH_SEGMENTS} 段"
+            )
+            segments = segments[:_MAX_SYNTH_SEGMENTS]
+        return segments
+
+    async def _synthesize_all(self, text: str, style_id: int) -> list[str]:
+        """按段合成全部文本，返回音频路径列表（可能为空）。"""
+        segments = self._segments(text)
+        if not segments:
+            return []
+        paths: list[str] = []
+        for seg in segments:
+            path = await self._synth_one(seg, style_id)
+            if path:
+                paths.append(path)
+        return paths
+
+    async def _synthesize(self, text: str, style_id: int) -> str | None:
+        """单段合成（保留原有语义：超长按配置跳过或截断），供测试合成等短文本场景使用。"""
         cleaned = clean_text(text)
         if not cleaned:
             return None
@@ -1348,33 +1598,7 @@ class CoeiroinkTTSPlugin(Star):
                 logger.info(f"[COEIROINK] 文本超过 {max_len} 字，跳过合成")
                 return None
             cleaned = cleaned[:max_len]
-        try:
-            if not await self._ensure_engine():
-                logger.warning("[COEIROINK] 引擎不可用，跳过语音合成")
-                return None
-            return await synthesize_with_recovery(
-                cleaned,
-                ensure_kwargs={
-                    "api_base": self._cfg("api_base"),
-                    "engine_dir": self._cfg("engine_dir"),
-                    "engine_bin": self._cfg("engine_bin") or None,
-                    "engine_log": self._cfg("engine_log"),
-                    "auto_start": bool(self._cfg("auto_start_engine")),
-                    "start_timeout": float(self._cfg("engine_start_timeout") or 90),
-                },
-                min_available_mb=float(self._cfg("min_available_memory_mb") or 0),
-                api_base=self._cfg("api_base"),
-                speaker_uuid=self._cfg("speaker_uuid"),
-                style_id=int(style_id),
-                speed_scale=float(self._cfg("speedScale") or 1.0),
-                output_sampling_rate=int(self._cfg("output_sampling_rate") or 0) or None,
-                enable_mp3=bool(self._cfg("enable_mp3")),
-                keep_temp_files=bool(self._cfg("keep_temp_files")),
-                ffmpeg_path=self._cfg("ffmpeg_path"),
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.error(f"[COEIROINK] 合成失败（不影响正常回复）：{e}")
-            return None
+        return await self._synth_one(cleaned, style_id)
 
     async def _to_japanese(self, text: str, umo: str | None) -> str | None:
         return await translate_to_japanese(
@@ -1411,27 +1635,32 @@ class CoeiroinkTTSPlugin(Star):
                 return
             speak_text: str | None = cleaned
         elif mode == "probabilistic":
-            if random.random() >= float(self._cfg("probability") or 0):
+            # P1-3：probability 夹取到 0~1，非法值告警
+            try:
+                probability = float(self._cfg("probability") or 0)
+            except (TypeError, ValueError):
+                probability = DEFAULT_CONFIG["probability"]
+            if not 0.0 <= probability <= 1.0:
+                logger.warning(f"[COEIROINK] probability={probability} 超出 0~1，已按边界夹取")
+                probability = max(0.0, min(1.0, probability))
+            if random.random() >= probability:
                 return
             # 已经是日语就直接朗读，省掉一次 LLM 翻译往返（翻译提示词对
             # 日语文本本就是“原样输出”，行为不变）
-            speak_text = (
-                cleaned if is_japanese(cleaned) else await self._to_japanese(cleaned, umo)
-            )
+            speak_text = cleaned if is_japanese(cleaned) else await self._to_japanese(cleaned, umo)
         else:  # always_translate
-            speak_text = (
-                cleaned if is_japanese(cleaned) else await self._to_japanese(cleaned, umo)
-            )
+            speak_text = cleaned if is_japanese(cleaned) else await self._to_japanese(cleaned, umo)
 
         if not speak_text:
             return
 
         style_id, _ = self._resolve_style(None)
-        path = await self._synthesize(speak_text, style_id)
-        if not path:
+        # P1-2：长文本按句分段合成，逐段追加语音（保持原文本不变，避免重复发送）
+        paths = await self._synthesize_all(speak_text, style_id)
+        if not paths:
             return
-        # 追加到即将发送的消息链中，不改动原文本，避免重复发送
-        result.chain.append(Record(file=path, url=path, text=speak_text))
+        for path in paths:
+            result.chain.append(Record(file=path, url=path, text=speak_text))
 
     # ---------------- 按需触发（命令） ----------------
 
@@ -1467,11 +1696,12 @@ class CoeiroinkTTSPlugin(Star):
         if not jp:
             yield event.plain_result("翻译失败：未找到可用的对话模型。")
             return
-        path = await self._synthesize(jp, style_id)
-        if not path:
+        # P1-2：长文本按句分段合成，逐条语音发出
+        paths = await self._synthesize_all(jp, style_id)
+        if not paths:
             yield event.plain_result("语音合成失败：引擎不可用或文本为空。")
             return
-        yield event.chain_result([Record(file=path, url=path, text=jp)])
+        yield event.chain_result([Record(file=p, url=p, text=jp) for p in paths])
 
     # ---------------- 按需触发（LLM 工具） ----------------
 
@@ -1492,8 +1722,9 @@ class CoeiroinkTTSPlugin(Star):
         jp = text if is_japanese(text) else await self._to_japanese(text, event.unified_msg_origin)
         if not jp:
             return "翻译失败：未找到可用的对话模型。"
-        path = await self._synthesize(jp, style_id)
-        if not path:
+        # P1-2：长文本按句分段合成，逐条语音发出
+        paths = await self._synthesize_all(jp, style_id)
+        if not paths:
             return "语音合成失败：引擎不可用或文本为空。"
-        await event.send(MessageChain([Record(file=path, url=path, text=jp)]))
+        await event.send(MessageChain([Record(file=p, url=p, text=jp) for p in paths]))
         return "已发送语音。"

@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 安装依赖
+        run: pip install astrbot httpx pytest ruff
+
+      - name: ruff 静态检查
+        run: ruff check .
+
+      - name: 语法编译检查
+        run: python -m py_compile main.py _selftest_synth.py
+
+      - name: 单元测试
+        run: pytest -q tests/
