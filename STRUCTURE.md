@@ -1,7 +1,7 @@
 # Tsukuyomi-chan COEIROINK 日语语音插件 · 结构说明（PLUGIN_STRUCTURE）
 
 > 本文档由代码实地梳理生成，只描述当前源码中**真实存在**的内容。
-> 版本：对应 `metadata.yaml` 的 `1.7.0`（v1.2.0 起插件通用化：不再内置任何机器相关路径；
+> 版本：对应 `metadata.yaml` 的 `1.7.1`（v1.2.0 起插件通用化：不再内置任何机器相关路径；
 > v1.2.1 起显示名改为 Tsukuyomi-chan COEIROINK 日语语音，并附音源/软件致谢；
 > v1.2.2 起补充 Logo 作者声明；v1.2.3 起补充渠道支持说明；
 > v1.3.0 起内置 Web UI 图形化管理面板（可开关，开启后原配置面板仅保留开关）；
@@ -21,7 +21,8 @@
 > 1.6.1 起「管理面板」标签页移除重复的测试合成区块，合成验证仅保留在「安装向导」第 5 步；
 > 1.6.2 起新增 pyproject.toml（ruff 配置 + 满足 CI pip 缓存条件），修复 1.6.0 的 CI 初始化失败；
 > 1.7.0 起补强运行风险与可观测性：合成排队上限、风格切换内存保护、Record.fromFileSystem、
-> Web UI 引擎日志与重启引擎、分段段数可配置、行为层测试）。
+> Web UI 引擎日志与重启引擎、分段段数可配置、行为层测试；
+> 1.7.1 起「管理面板」标签页内新增二级菜单（监控 / 设置），功能分组不再一屏堆叠）。
 > 无法从代码/环境中确认的点，统一用「**待确认**」标注，不做臆测。
 
 > ### 🔊 音源与软件致谢
@@ -53,7 +54,7 @@
 ├── pyproject.toml         # 开发工具配置（ruff 规则集）与 CI 依赖缓存标记；插件运行不依赖它
 ├── .github/workflows/ci.yml  # GitHub Actions：ruff + py_compile + pytest
 ├── pages/                 # 内置 Web UI（AstrBot 插件 Pages）
-│   └── settings/          # 双标签页面（管理面板 + 安装向导）：index.html + assets/logo.png
+│   └── settings/          # 双层导航页面（管理面板〔监控/设置〕+ 安装向导）：index.html + assets/logo.png
 ├── .astrbot-plugin/       # 插件国际化（页面标题）
 │   └── i18n/              # zh-CN.json / en-US.json：pages.settings.title=管理面板/Dashboard
 └── __pycache__/           # Python 字节码缓存（main.cpython-312.pyc），运行期自动生成
@@ -61,7 +62,7 @@
 
 | 文件 | 职责 |
 | --- | --- |
-| `metadata.yaml` | 插件标识 `name: astrbot_plugin_coeiroink_tts`、`display_name: Tsukuyomi-chan COEIROINK 日语语音`、`version: 1.7.0`、`author: Aurora & deepseek`；市场字段：`repo`（GitHub 地址）、`short_desc`、`support_platforms: [aiocqhttp]`（NapCat/OneBot v11，已实测）、`astrbot_version: ">=4.24.5,<5"`（插件 Pages 最早可用版本）、`category: utilities`、`tags` |
+| `metadata.yaml` | 插件标识 `name: astrbot_plugin_coeiroink_tts`、`display_name: Tsukuyomi-chan COEIROINK 日语语音`、`version: 1.7.1`、`author: Aurora & deepseek`；市场字段：`repo`（GitHub 地址）、`short_desc`、`support_platforms: [aiocqhttp]`（NapCat/OneBot v11，已实测）、`astrbot_version: ">=4.24.5,<5"`（插件 Pages 最早可用版本）、`category: utilities`、`tags` |
 | `main.py` | 全部实现：常量、默认配置、风格归一化、文本清洗、引擎探测/拉起、合成链路、翻译、TTS Provider 适配器、插件主体（自动触发 + 命令 + LLM 工具） |
 | `_conf_schema.json` | 配置项定义，AstrBot 据此渲染配置面板；键名与 `main.py` 中 `DEFAULT_CONFIG` 一一对应 |
 | `README.md` | 用户文档：风格对照、配置方法、单次切换用法、非法值行为、内存提示 |
@@ -187,7 +188,7 @@
 3. **LLM 工具** `coeiroink_speak` → `_llm_tool_handler(event, text, style=None)`
    - 参数：`text`（必填）、`style`（可选，本次朗读临时风格）
    - （已是日语则跳过翻译）翻译 → `_synthesize_all` 分段合成 → `event.send(MessageChain([Record(...)]))`，返回「已发送语音。」
-4. **Web UI Pages**：`pages/settings/index.html`（单文件自包含，双标签：管理面板 + 安装向导，通过 `window.AstrBotPluginPage` bridge 与后端通信，支持暗色主题）；**因 AstrBot 页面 iframe 沙箱（无 allow-top-navigation）与 bridge 均不支持跨页跳转，两个功能合并为单页标签切换**；启动引擎就绪后自动切回管理面板标签；页面标题经 `.astrbot-plugin/i18n/*.json` 的 `pages.settings.title` 本地化（zh-CN：管理面板）
+4. **Web UI Pages**：`pages/settings/index.html`（单文件自包含，双层导航：一级标签「管理面板 / 安装向导」，管理面板内二级菜单「监控 / 设置」——监控含运行状态与引擎日志卡片，设置含全部配置卡片与保存/重新加载；通过 `window.AstrBotPluginPage` bridge 与后端通信，支持暗色主题）；**因 AstrBot 页面 iframe 沙箱（无 allow-top-navigation）与 bridge 均不支持跨页跳转，两个功能合并为单页标签切换**；启动引擎就绪后自动切回管理面板标签；页面标题经 `.astrbot-plugin/i18n/*.json` 的 `pages.settings.title` 本地化（zh-CN：管理面板）
 
 ---
 

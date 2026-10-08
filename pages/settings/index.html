@@ -33,6 +33,14 @@
       border-radius: 999px; padding: 7px 18px; font-size: 13px; font-weight: 600; cursor: pointer;
     }
     .tab.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .subtabs { display: flex; gap: 6px; margin: 0 0 14px; }
+    .subtab {
+      border: 1px solid var(--line); background: transparent; color: var(--muted);
+      border-radius: 8px; padding: 5px 16px; font-size: 12.5px; font-weight: 600; cursor: pointer;
+    }
+    .subtab.active {
+      background: var(--accent-soft); border-color: var(--accent); color: var(--accent);
+    }
     .card {
       background: var(--card); border: 1px solid var(--line);
       border-radius: 12px; padding: 16px 18px; margin-bottom: 16px;
@@ -126,34 +134,44 @@
 
   <!-- ================= 管理面板 ================= -->
   <section id="tab-panel">
-    <div class="card">
-      <h2>运行状态 <span class="badge" id="webuiStateBadge">…</span></h2>
-      <div class="grid">
-        <div class="stat"><div class="k">插件启用</div><div class="v" id="stPlugin">…</div></div>
-        <div class="stat"><div class="k">引擎</div><div class="v" id="stEngine">…</div></div>
-        <div class="stat"><div class="k">可用内存</div><div class="v" id="stMem">…</div></div>
-        <div class="stat"><div class="k">当前风格</div><div class="v" id="stStyle">…</div></div>
-        <div class="stat"><div class="k">ffmpeg</div><div class="v" id="stFfmpeg">…</div></div>
-        <div class="stat"><div class="k">引擎进程</div><div class="v" id="stPid">…</div></div>
-        <div class="stat"><div class="k">已加载风格（常驻内存）</div><div class="v" id="stLoadedStyles">…</div></div>
-      </div>
-      <div class="actions">
-        <button class="ghost" id="refreshStatusBtn">刷新状态</button>
-        <button class="ghost" id="restartEngineBtn">重启引擎</button>
-        <button class="ghost" id="gotoWizardBtn">打开安装向导 →</button>
-      </div>
-      <div class="result" id="restartResult"></div>
+    <div class="subtabs">
+      <button class="subtab active" data-subtab="monitor">监控</button>
+      <button class="subtab" data-subtab="settings">设置</button>
     </div>
 
-    <div class="card">
-      <h2>引擎日志 <span class="badge" id="logBadge">…</span></h2>
-      <pre id="logContent" style="max-height:260px;overflow:auto;background:var(--code-bg);border-radius:8px;padding:10px 12px;font-size:12px;margin:0">（点击“刷新日志”加载）</pre>
-      <div class="actions">
-        <button class="ghost" id="refreshLogBtn">刷新日志</button>
+    <!-- 二级菜单：监控 -->
+    <div id="panel-monitor">
+      <div class="card">
+        <h2>运行状态 <span class="badge" id="webuiStateBadge">…</span></h2>
+        <div class="grid">
+          <div class="stat"><div class="k">插件启用</div><div class="v" id="stPlugin">…</div></div>
+          <div class="stat"><div class="k">引擎</div><div class="v" id="stEngine">…</div></div>
+          <div class="stat"><div class="k">可用内存</div><div class="v" id="stMem">…</div></div>
+          <div class="stat"><div class="k">当前风格</div><div class="v" id="stStyle">…</div></div>
+          <div class="stat"><div class="k">ffmpeg</div><div class="v" id="stFfmpeg">…</div></div>
+          <div class="stat"><div class="k">引擎进程</div><div class="v" id="stPid">…</div></div>
+          <div class="stat"><div class="k">已加载风格（常驻内存）</div><div class="v" id="stLoadedStyles">…</div></div>
+        </div>
+        <div class="actions">
+          <button class="ghost" id="refreshStatusBtn">刷新状态</button>
+          <button class="ghost" id="restartEngineBtn">重启引擎</button>
+          <button class="ghost" id="gotoWizardBtn">打开安装向导 →</button>
+        </div>
+        <div class="result" id="restartResult"></div>
+      </div>
+
+      <div class="card">
+        <h2>引擎日志 <span class="badge" id="logBadge">…</span></h2>
+        <pre id="logContent" style="max-height:260px;overflow:auto;background:var(--code-bg);border-radius:8px;padding:10px 12px;font-size:12px;margin:0">（点击“刷新日志”加载）</pre>
+        <div class="actions">
+          <button class="ghost" id="refreshLogBtn">刷新日志</button>
+        </div>
       </div>
     </div>
 
-    <div class="card">
+    <!-- 二级菜单：设置 -->
+    <div id="panel-settings" hidden>
+      <div class="card">
       <h2>基本设置</h2>
       <div class="fgroup">
         <div class="field check"><input type="checkbox" id="cfg_enabled" /><label for="cfg_enabled">启用插件</label></div>
@@ -233,6 +251,7 @@
       <button id="saveBtn">保存配置</button>
       <button class="ghost" id="reloadBtn">重新加载</button>
     </div>
+    </div><!-- /panel-settings -->
   </section>
 
   <!-- ================= 安装向导 ================= -->
@@ -366,6 +385,17 @@
     $("tab-wizard").hidden = name !== "wizard";
     if (name === "panel") { loadAll(); loadLogs(); }
     if (name === "wizard") { loadInfo(); }
+  }
+
+  /* 管理面板二级菜单：监控 / 设置 */
+  function switchSubTab(name) {
+    document.querySelectorAll(".subtab").forEach((t) => {
+      t.classList.toggle("active", t.dataset.subtab === name);
+    });
+    $("panel-monitor").hidden = name !== "monitor";
+    $("panel-settings").hidden = name !== "settings";
+    if (name === "monitor") { refreshStatus(); loadLogs(); }
+    if (name === "settings") { loadAll(); }
   }
 
   /* ============ 管理面板 ============ */
@@ -714,6 +744,9 @@
   document.querySelectorAll(".tab").forEach((t) => {
     t.addEventListener("click", () => switchTab(t.dataset.tab));
   });
+  document.querySelectorAll(".subtab").forEach((t) => {
+    t.addEventListener("click", () => switchSubTab(t.dataset.subtab));
+  });
   $("gotoWizardBtn").addEventListener("click", () => switchTab("wizard"));
   $("wzBackPanelBtn").addEventListener("click", () => switchTab("panel"));
 
@@ -736,6 +769,7 @@
 
   await bridge.ready();
   await loadAll();
+  await loadLogs();  // 默认「监控」二级菜单包含日志卡片，进入即加载
 </script>
 </body>
 </html>
