@@ -201,7 +201,8 @@ Web UI 后端接口（`context.register_web_api`，路由前缀为插件标识�
 ## 九、开发者文档
 
 插件目录树、核心类与函数、风格对照、完整配置清单、引擎依赖、运行时约束与对外接口等，
-详见 **[STRUCTURE.md](./STRUCTURE.md)**（插件结构说明）；版本变更见 **[CHANGELOG.md](./CHANGELOG.md)**（更新日志）。
+详见 **[STRUCTURE.md](./STRUCTURE.md)**（插件结构说明）；版本变更见 **[CHANGELOG.md](./CHANGELOG.md)**（更新日志）；
+待实施的改进项见 **[ROADMAP.md](./ROADMAP.md)**（改进路线图）。
 
 ---
 
