@@ -81,7 +81,7 @@
     button:hover { opacity: .88; }
     button.ghost { background: transparent; border: 1px solid var(--accent); color: var(--accent); }
     button:disabled { opacity: .45; cursor: not-allowed; }
-    .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
+    .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 12px; margin-bottom: 16px; }
     .testrow { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
     .testrow input[type="text"] { flex: 1; min-width: 200px; }
     .dl { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin-bottom: 10px; background: var(--bg); }
@@ -115,7 +115,7 @@
   </header>
 
   <div id="webuiBanner" class="banner" style="display:none">
-    <p><b>Web UI 管理未启用。</b>启用后，插件配置请在本页管理（原配置面板仅保留开关）。</p>
+    <p><b>Web UI 管理未启用。</b>启用后，插件配置请在本页管理（原配置面板仅保留基础项）。</p>
     <button id="enableWebuiBtn">启用 Web UI 管理</button>
   </div>
 
@@ -203,7 +203,7 @@
       <div class="fgroup">
         <div class="field check">
           <input type="checkbox" id="cfg_enable_webui" />
-          <label for="cfg_enable_webui">启用 Web UI 管理（开启后请在本页管理配置，原配置面板仅保留此开关与插件启用开关）</label>
+          <label for="cfg_enable_webui">启用 Web UI 管理（开启后请在本页管理配置；原配置面板仅保留 5 个基础项：启用插件 / Web UI 开关 / 触发模式 / 默认风格 / 引擎目录）</label>
         </div>
       </div>
     </div>
@@ -211,16 +211,6 @@
     <div class="actions">
       <button id="saveBtn">保存配置</button>
       <button class="ghost" id="reloadBtn">重新加载</button>
-    </div>
-
-    <div class="card">
-      <h2>测试合成</h2>
-      <div class="testrow">
-        <input type="text" id="testText" placeholder="测试文本（留空用默认日语）" />
-        <select id="testStyle"><option value="">使用默认风格</option></select>
-        <button id="testBtn">合成测试语音</button>
-      </div>
-      <div class="result" id="testResult"></div>
     </div>
   </section>
 
@@ -408,18 +398,15 @@
       modeSel.appendChild(opt);
     });
     const styleSel = $("cfg_style_id");
-    const testStyle = $("testStyle");
     const wzTestStyle = $("wzTestStyle");
-    styleSel.innerHTML = ""; testStyle.innerHTML = ""; wzTestStyle.innerHTML = "";
+    styleSel.innerHTML = ""; wzTestStyle.innerHTML = "";
     const keep = document.createElement("option");
     keep.value = ""; keep.textContent = "使用默认风格";
-    testStyle.appendChild(keep);
-    wzTestStyle.appendChild(keep.cloneNode(true));
+    wzTestStyle.appendChild(keep);
     (meta.styles || []).forEach((s) => {
       const opt = document.createElement("option");
       opt.value = String(s.id); opt.textContent = s.label;
       styleSel.appendChild(opt);
-      testStyle.appendChild(opt.cloneNode(true));
       wzTestStyle.appendChild(opt.cloneNode(true));
     });
   }
@@ -471,26 +458,6 @@
       toast("保存失败：" + e.message, false);
     } finally {
       $("saveBtn").disabled = false;
-    }
-  }
-
-  async function runTest() {
-    const text = $("testText").value.trim();
-    const style = $("testStyle").value;
-    const btn = $("testBtn");
-    const out = $("testResult");
-    btn.disabled = true;
-    out.textContent = "合成中…（引擎首次加载风格可能需要数十秒）";
-    try {
-      const res = await bridge.apiPost("test", {
-        text: text || "こんにちは、これはテスト音声です。",
-        style: style || null,
-      });
-      out.textContent = `✅ 合成成功\n朗读文本：${res.text}\n风格：${res.style_label}\n文件：${res.file}`;
-    } catch (e) {
-      out.textContent = "❌ " + e.message;
-    } finally {
-      btn.disabled = false;
     }
   }
 
@@ -658,7 +625,6 @@
   $("saveBtn").addEventListener("click", saveConfig);
   $("reloadBtn").addEventListener("click", loadAll);
   $("refreshStatusBtn").addEventListener("click", refreshStatus);
-  $("testBtn").addEventListener("click", runTest);
   $("enableWebuiBtn").addEventListener("click", enableWebui);
 
   $("wzRefreshInfoBtn").addEventListener("click", loadInfo);
