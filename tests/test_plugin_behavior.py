@@ -9,6 +9,7 @@ import asyncio
 import importlib.util
 import os
 import time
+from collections import OrderedDict
 from pathlib import Path
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
@@ -33,6 +34,7 @@ def _make_plugin(**overrides):
     plugin.config.update(overrides)
     plugin._astrbot_config = None
     plugin._loaded_styles = set()
+    plugin._synth_cache = OrderedDict()  # 真实类在 __init__ 中初始化
     plugin._bg_tasks = set()
     plugin._warmup_task = None
     plugin._cleanup_task = None
@@ -165,3 +167,72 @@ def test_cleanup_temp_audio_removes_only_expired(tmp_path, monkeypatch):
 
     assert not old.exists()
     assert new.exists()
+
+
+# ---------------------------------------------------------------------------
+# 合成结果 LRU 缓存（1.8.0）
+# ---------------------------------------------------------------------------
+
+
+def _stub_synth_plugin(tmp_path, monkeypatch, **overrides):
+    """构造插件实例 + 假合成函数，返回 (plugin, 调用计数)。"""
+    plugin = _make_plugin(
+        max_concurrent_synth=1,
+        max_synth_queue=2,
+        api_base="http://127.0.0.1:50032",
+        **overrides,
+    )
+    calls = {"n": 0}
+    audio = tmp_path / "cached.mp3"
+    audio.write_bytes(b"fake-mp3")
+
+    async def fake_ensure_engine():
+        return True
+
+    async def fake_synthesize(text, **kwargs):
+        calls["n"] += 1
+        return str(audio)
+
+    plugin._ensure_engine = fake_ensure_engine
+    monkeypatch.setattr(m, "synthesize_with_recovery", fake_synthesize)
+    return plugin, calls, audio
+
+
+def test_synth_cache_hit_avoids_engine_call(tmp_path, monkeypatch):
+    plugin, calls, audio = _stub_synth_plugin(tmp_path, monkeypatch, synth_cache_size=8)
+    first = asyncio.run(plugin._synth_one("こんにちは", 5))
+    second = asyncio.run(plugin._synth_one("こんにちは", 5))
+    assert first == second == str(audio)
+    assert calls["n"] == 1  # 第二次命中缓存，未再次调用引擎
+
+
+def test_synth_cache_disabled_by_zero_size(tmp_path, monkeypatch):
+    plugin, calls, _ = _stub_synth_plugin(tmp_path, monkeypatch, synth_cache_size=0)
+    asyncio.run(plugin._synth_one("こんにちは", 5))
+    asyncio.run(plugin._synth_one("こんにちは", 5))
+    assert calls["n"] == 2  # 缓存禁用 => 每次都真实合成
+
+
+def test_synth_cache_key_includes_style(tmp_path, monkeypatch):
+    plugin, calls, _ = _stub_synth_plugin(tmp_path, monkeypatch, synth_cache_size=8)
+    asyncio.run(plugin._synth_one("こんにちは", 5))
+    asyncio.run(plugin._synth_one("こんにちは", 6))
+    assert calls["n"] == 2  # 不同风格不共用缓存
+
+
+def test_synth_cache_drops_entry_when_file_missing(tmp_path, monkeypatch):
+    plugin, calls, audio = _stub_synth_plugin(tmp_path, monkeypatch, synth_cache_size=8)
+    asyncio.run(plugin._synth_one("こんにちは", 5))
+    audio.unlink()  # 模拟临时目录定时清理
+    asyncio.run(plugin._synth_one("こんにちは", 5))
+    assert calls["n"] == 2  # 文件已不在 => 重新合成
+    assert len(plugin._synth_cache) == 1
+
+
+def test_synth_cache_lru_eviction(tmp_path, monkeypatch):
+    plugin, calls, _ = _stub_synth_plugin(tmp_path, monkeypatch, synth_cache_size=2)
+    for text in ("あ", "い", "う"):
+        asyncio.run(plugin._synth_one(text, 5))
+    assert len(plugin._synth_cache) == 2  # 超过上限淘汰最旧
+    asyncio.run(plugin._synth_one("あ", 5))
+    assert calls["n"] == 4  # "あ" 已被淘汰 => 重新合成

@@ -211,5 +211,12 @@
         "type": "int",
         "default": 800,
         "invisible": true
+    },
+    "synth_cache_size": {
+        "description": "合成结果缓存条数",
+        "hint": "相同文本 + 相同音色参数会直接复用已生成的音频（LRU 缓存），可省掉每次 1~10 秒的引擎推理。默认 32；0 表示禁用缓存。缓存只保存文件路径，音频仍由临时目录清理策略管理。",
+        "type": "int",
+        "default": 32,
+        "invisible": true
     }
 }

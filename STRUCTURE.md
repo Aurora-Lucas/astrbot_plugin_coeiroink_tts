@@ -1,7 +1,7 @@
 # Tsukuyomi-chan COEIROINK 日语语音插件 · 结构说明（PLUGIN_STRUCTURE）
 
 > 本文档由代码实地梳理生成，只描述当前源码中**真实存在**的内容。
-> 版本：对应 `metadata.yaml` 的 `1.7.1`（v1.2.0 起插件通用化：不再内置任何机器相关路径；
+> 版本：对应 `metadata.yaml` 的 `1.8.0`（v1.2.0 起插件通用化：不再内置任何机器相关路径；
 > v1.2.1 起显示名改为 Tsukuyomi-chan COEIROINK 日语语音，并附音源/软件致谢；
 > v1.2.2 起补充 Logo 作者声明；v1.2.3 起补充渠道支持说明；
 > v1.3.0 起内置 Web UI 图形化管理面板（可开关，开启后原配置面板仅保留开关）；
@@ -22,7 +22,8 @@
 > 1.6.2 起新增 pyproject.toml（ruff 配置 + 满足 CI pip 缓存条件），修复 1.6.0 的 CI 初始化失败；
 > 1.7.0 起补强运行风险与可观测性：合成排队上限、风格切换内存保护、Record.fromFileSystem、
 > Web UI 引擎日志与重启引擎、分段段数可配置、行为层测试；
-> 1.7.1 起「管理面板」标签页内新增二级菜单（监控 / 设置），功能分组不再一屏堆叠）。
+> 1.7.1 起「管理面板」标签页内新增二级菜单（监控 / 设置），功能分组不再一屏堆叠；
+> 1.8.0 起性能优化：合成结果 LRU 缓存、is_japanese/clean_text 快路径、内存读数与地址校验缓存）。
 > 无法从代码/环境中确认的点，统一用「**待确认**」标注，不做臆测。
 
 > ### 🔊 音源与软件致谢
@@ -62,7 +63,7 @@
 
 | 文件 | 职责 |
 | --- | --- |
-| `metadata.yaml` | 插件标识 `name: astrbot_plugin_coeiroink_tts`、`display_name: Tsukuyomi-chan COEIROINK 日语语音`、`version: 1.7.1`、`author: Aurora & deepseek`；市场字段：`repo`（GitHub 地址）、`short_desc`、`support_platforms: [aiocqhttp]`（NapCat/OneBot v11，已实测）、`astrbot_version: ">=4.24.5,<5"`（插件 Pages 最早可用版本）、`category: utilities`、`tags` |
+| `metadata.yaml` | 插件标识 `name: astrbot_plugin_coeiroink_tts`、`display_name: Tsukuyomi-chan COEIROINK 日语语音`、`version: 1.8.0`、`author: Aurora & deepseek`；市场字段：`repo`（GitHub 地址）、`short_desc`、`support_platforms: [aiocqhttp]`（NapCat/OneBot v11，已实测）、`astrbot_version: ">=4.24.5,<5"`（插件 Pages 最早可用版本）、`category: utilities`、`tags` |
 | `main.py` | 全部实现：常量、默认配置、风格归一化、文本清洗、引擎探测/拉起、合成链路、翻译、TTS Provider 适配器、插件主体（自动触发 + 命令 + LLM 工具） |
 | `_conf_schema.json` | 配置项定义，AstrBot 据此渲染配置面板；键名与 `main.py` 中 `DEFAULT_CONFIG` 一一对应 |
 | `README.md` | 用户文档：风格对照、配置方法、单次切换用法、非法值行为、内存提示 |
@@ -92,6 +93,8 @@
 - `_MAX_SYNTH_SEGMENTS = 6`：长文本分段合成的段数上限（P1-2）
 - `_SYNTH_INFLIGHT`：进程内在途（含等待）合成计数，配合 `max_synth_queue` 实现排队上限
 - `_LOG_TAIL_BYTES = 64 * 1024`：Web UI 引擎日志尾读上限
+- `_MEM_CACHE_TTL = 2.0` / `_API_LOCAL_CACHE`：可用内存读数短 TTL 缓存、回环判定备忘（1.8.0 性能）
+- `_KANA_SET` / `_KANA_DELETE_TABLE`：假名码点集合与 translate 删除表（`is_japanese` 快路径）
 - `DEFAULT_CONFIG`：插件默认配置字典（键与 `_conf_schema.json` 对应，共 28 项；含 `enable_webui`、`max_concurrent_synth`、`max_synth_queue`、`max_synth_segments`、`allow_style_override`、`style_switch_min_free_mb`、`allow_remote_engine`）
 - 通用解析函数（环境相关路径统一走「配置项 → 环境变量 → 自动推导」）：
   - `resolve_engine_dir(cfg) -> str`：引擎根目录（配置 > `COEIROINK_ENGINE_DIR`）
@@ -227,6 +230,7 @@
 | `max_concurrent_synth` | int | `1` | **并发合成上限**（P0-2）；内存小的机器保持 1 |
 | `max_synth_queue` | int | `2` | 排队上限：在途数 > 并发上限 + 本值时跳过本次合成（1.7.0） |
 | `max_synth_segments` | int | `6` | 长文本分段朗读的最大段数（1.7.0，原为硬编码） |
+| `synth_cache_size` | int | `32` | 合成结果 LRU 缓存条数（1.8.0；0=禁用，相同文本直接复用音频） |
 | `allow_style_override` | bool | `true` | 是否允许单次风格切换；关闭后只用默认风格（1.7.0） |
 | `style_switch_min_free_mb` | int | `800` | 切换到未加载风格前的最低可用内存（1.7.0） |
 | `allow_remote_engine` | bool | `false` | 允许向非回环地址的引擎发送文本（P2-5）；默认禁止防外发 |

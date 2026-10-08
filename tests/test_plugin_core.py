@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -211,3 +212,46 @@ def test_synth_semaphore_reuse():
     assert m.get_synth_semaphore(2) is not m.get_synth_semaphore(1)
     # 非法值（<1）夹取到 1
     assert m.get_synth_semaphore(0) is m.get_synth_semaphore(1)
+
+
+# ---------------------------------------------------------------------------
+# 性能相关：短 TTL 缓存与备忘（1.8.0）
+# ---------------------------------------------------------------------------
+
+
+def test_available_memory_mb_cached_within_ttl(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_read():
+        calls["n"] += 1
+        return 1234.0
+
+    monkeypatch.setattr(m, "_read_available_memory_mb", fake_read)
+    monkeypatch.setattr(m, "_MEM_CACHE", None)
+    assert m.available_memory_mb() == 1234.0
+    assert m.available_memory_mb() == 1234.0
+    assert calls["n"] == 1  # TTL 内复用上一次读数
+
+    # 缓存过期后重新读取
+    monkeypatch.setattr(m, "_MEM_CACHE", (time.monotonic() - 10, 1.0))
+    assert m.available_memory_mb() == 1234.0
+    assert calls["n"] == 2
+
+    # use_cache=False 强制读取
+    assert m.available_memory_mb(use_cache=False) == 1234.0
+    assert calls["n"] == 3
+
+
+def test_api_base_is_local_memoized(monkeypatch):
+    calls = {"n": 0}
+    real_urlparse = m.urlparse
+
+    def counting_urlparse(url):
+        calls["n"] += 1
+        return real_urlparse(url)
+
+    monkeypatch.setattr(m, "urlparse", counting_urlparse)
+    monkeypatch.setattr(m, "_API_LOCAL_CACHE", {})
+    assert m.api_base_is_local("http://127.0.0.1:50032") is True
+    assert m.api_base_is_local("http://127.0.0.1:50032") is True
+    assert calls["n"] == 1  # 同一地址只解析一次

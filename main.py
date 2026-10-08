@@ -22,6 +22,7 @@ import subprocess
 import sys
 import time
 import uuid
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -115,6 +116,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "max_concurrent_synth": 1,
     "max_synth_queue": 2,
     "max_synth_segments": _MAX_SYNTH_SEGMENTS,
+    "synth_cache_size": 32,
     "allow_style_override": True,
     "style_switch_min_free_mb": 800,
     "allow_remote_engine": False,
@@ -305,38 +307,45 @@ def extract_style_prefix(text: str) -> tuple[str | None, str]:
 # 文本工具
 # ---------------------------------------------------------------------------
 
-_KANA_RE = re.compile(r"[\u3040-\u309f\u30a0-\u30ff\u30fc]")
-_URL_RE = re.compile(r"https?://\S+")
+_KANA_SET = frozenset(chr(c) for c in range(0x3040, 0x3100)) | {"\u30fc"}
+# translate 删除表：用 C 层一次性剔除假名，避免逐字判断
+_KANA_DELETE_TABLE = {ord(c): None for c in _KANA_SET}
 _FENCE_RE = re.compile(r"```.*?```", re.DOTALL)
-# 去掉常见 Markdown 标记与控制字符，但保留中日常用标点
-_MD_RE = re.compile(r"[*_`~#>\[\]()]|!\[[^\]]*\]")
+# URL 与 Markdown 标记合并为一次替换（两者都替换为空格，合并后只扫描一遍文本）
+_URL_MD_RE = re.compile(r"https?://\S+|!\[[^\]]*\]|[*_`~#>\[\]()]")
 _EMOJI_RE = re.compile("[\U0001f000-\U0001faff\u200d\ufe0f\u2600-\u26ff]")
 
 
 def clean_text(text: str) -> str:
-    """清理待合成文本：去代码块、URL、Markdown 标记、emoji，压缩空白。"""
+    """清理待合成文本：去代码块、URL、Markdown 标记、emoji，压缩空白。
+
+    性能：URL 与 Markdown 合并为一次正则替换；空白压缩用 C 层的
+    ``" ".join(text.split())`` 代替正则，减少每轮回复的正则扫描次数。
+    """
     if not text:
         return ""
     t = _FENCE_RE.sub(" ", text)
-    t = _URL_RE.sub(" ", t)
-    t = _MD_RE.sub(" ", t)
+    t = _URL_MD_RE.sub(" ", t)
     t = _EMOJI_RE.sub(" ", t)
-    t = t.replace("\r", " ").replace("\n", " ")
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
+    return " ".join(t.split())
 
 
 def is_japanese(text: str) -> bool:
-    """粗略判断文本是否为日语：含假名，且假名占非空白字符比例达标。"""
+    """粗略判断文本是否为日语：含假名，且假名占非空白字符比例达标。
+
+    性能：用 C 层的 ``split`` / ``translate`` 统计假名占比，避免逐字
+    Python 循环与正则调用（原实现逐字 ``re.match``，124 字约 38µs/次）。
+    """
     if not text:
         return False
-    meaningful = [c for c in text if not c.isspace()]
-    if not meaningful:
+    stripped = "".join(text.split())  # 去掉全部空白（C 层）
+    total = len(stripped)
+    if total == 0:
         return False
-    kana = sum(1 for c in meaningful if _KANA_RE.match(c))
+    kana = total - len(stripped.translate(_KANA_DELETE_TABLE))
     if kana == 0:
         return False
-    return (kana / len(meaningful)) >= 0.1
+    return (kana / total) >= 0.1
 
 
 _SENT_ENDERS_RE = re.compile(r"(?<=[。！？!?…])")
@@ -380,16 +389,26 @@ def split_text_segments(text: str, max_len: int) -> list[str]:
 # 回环主机名（P2-5）：默认只允许向本机引擎发送待朗读文本，防止内容外发
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
+# api_base 判定结果备忘（同一地址每段合成都会校验一次，避免重复 urlparse）
+_API_LOCAL_CACHE: dict[str, bool] = {}
+
 
 def api_base_is_local(api_base: str) -> bool:
     """判断引擎地址是否为回环地址。解析失败视为非本地（保守拒绝）。"""
+    key = str(api_base or "")
+    cached = _API_LOCAL_CACHE.get(key)
+    if cached is not None:
+        return cached
     try:
-        host = (urlparse(str(api_base or "")).hostname or "").lower()
+        host = (urlparse(key).hostname or "").lower()
     except ValueError:
-        return False
-    if not host:
-        return False
-    return host in _LOOPBACK_HOSTS or host.startswith("127.")
+        result = False
+    else:
+        result = bool(host) and (host in _LOOPBACK_HOSTS or host.startswith("127."))
+    if len(_API_LOCAL_CACHE) > 16:  # 配置改动频繁时防止无限增长
+        _API_LOCAL_CACHE.clear()
+    _API_LOCAL_CACHE[key] = result
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -686,6 +705,7 @@ def wav_to_mp3(
         )
     cmd = [
         ffmpeg,
+        "-nostdin",
         "-y",
         "-hide_banner",
         "-loglevel",
@@ -803,13 +823,8 @@ def _available_memory_macos_mb() -> float | None:
     return None
 
 
-def available_memory_mb() -> float | None:
-    """读取当前系统可用内存（单位 MB）。
-
-    Linux 读 /proc/meminfo 的 MemAvailable；Windows 用
-    GlobalMemoryStatusEx；macOS 用 vm_stat（free+inactive 页）；
-    其他平台或读取失败返回 None（跳过内存门槛检查，不阻断合成）。
-    """
+def _read_available_memory_mb() -> float | None:
+    """实际读取可用内存（Linux /proc/meminfo、Windows API、macOS vm_stat）。"""
     try:
         with open("/proc/meminfo", encoding="ascii") as f:
             for line in f:
@@ -822,6 +837,28 @@ def available_memory_mb() -> float | None:
     if sys.platform == "darwin":
         return _available_memory_macos_mb()
     return None
+
+
+# 可用内存读数的短 TTL 缓存：一次回复可能要合成多段，状态接口也会轮询，
+# 2 秒内的读数变化没有意义，缓存可省掉每段一次的 /proc 读取。
+_MEM_CACHE_TTL = 2.0
+_MEM_CACHE: "tuple[float, float | None] | None" = None
+
+
+def available_memory_mb(*, use_cache: bool = True) -> float | None:
+    """读取当前系统可用内存（单位 MB，带 2 秒 TTL 缓存）。
+
+    Linux 读 /proc/meminfo 的 MemAvailable；Windows 用
+    GlobalMemoryStatusEx；macOS 用 vm_stat（free+inactive 页）；
+    其他平台或读取失败返回 None（跳过内存门槛检查，不阻断合成）。
+    """
+    global _MEM_CACHE
+    now = time.monotonic()
+    if use_cache and _MEM_CACHE is not None and now - _MEM_CACHE[0] < _MEM_CACHE_TTL:
+        return _MEM_CACHE[1]
+    value = _read_available_memory_mb()
+    _MEM_CACHE = (now, value)
+    return value
 
 
 async def synthesize_with_recovery(
@@ -1020,6 +1057,8 @@ class CoeiroinkTTSPlugin(Star):
         self._bg_tasks: set[asyncio.Task] = set()
         # 已由引擎加载（常驻内存）的风格集合；用于单次风格切换的内存保护
         self._loaded_styles: set[int] = set()
+        # 合成结果 LRU 缓存：相同文本+参数直接复用已生成的音频，省掉数秒的引擎推理
+        self._synth_cache: OrderedDict[tuple[Any, ...], str] = OrderedDict()
 
     # ---------------- 配置 ----------------
 
@@ -1227,6 +1266,7 @@ class CoeiroinkTTSPlugin(Star):
             "max_synth_queue",
             "max_synth_segments",
             "style_switch_min_free_mb",
+            "synth_cache_size",
         }
         float_keys = {"probability", "speedScale"}
         bool_keys = {
@@ -1279,6 +1319,8 @@ class CoeiroinkTTSPlugin(Star):
                 return error_response("max_synth_segments 必须 ≥ 1", status_code=400)
             if key == "style_switch_min_free_mb" and value < 0:
                 return error_response("style_switch_min_free_mb 必须 ≥ 0", status_code=400)
+            if key == "synth_cache_size" and value < 0:
+                return error_response("synth_cache_size 必须 ≥ 0（0=禁用缓存）", status_code=400)
             updated[key] = value
 
         if not updated:
@@ -1679,13 +1721,53 @@ class CoeiroinkTTSPlugin(Star):
         )
         return False
 
+    def _synth_cache_key(self, text: str, style_id: int) -> tuple[Any, ...]:
+        """合成缓存键：文本 + 影响音色的全部参数。"""
+        return (
+            text,
+            int(style_id),
+            float(self._cfg("speedScale") or 1.0),
+            str(self._cfg("speaker_uuid") or ""),
+            int(self._cfg("output_sampling_rate") or 0),
+            bool(self._cfg("enable_mp3")),
+        )
+
+    def _synth_cache_get(self, key: tuple[Any, ...]) -> str | None:
+        """命中缓存时返回音频路径；文件已被临时清理时丢弃该条目。"""
+        path = self._synth_cache.get(key)
+        if not path:
+            return None
+        if os.path.isfile(path):
+            self._synth_cache.move_to_end(key)
+            return path
+        self._synth_cache.pop(key, None)
+        return None
+
+    def _synth_cache_put(self, key: tuple[Any, ...], path: str) -> None:
+        """写入缓存并按 `synth_cache_size` 做 LRU 淘汰（0 表示禁用）。"""
+        max_size = max(0, int(self._cfg("synth_cache_size") or 0))
+        if max_size <= 0:
+            return
+        self._synth_cache[key] = path
+        self._synth_cache.move_to_end(key)
+        while len(self._synth_cache) > max_size:
+            self._synth_cache.popitem(last=False)
+
     async def _synth_one(self, text: str, style_id: int) -> str | None:
         """合成单段文本，返回音频路径；不可用时返回 None。
 
+        - 结果缓存：相同文本 + 相同音色参数直接复用已有音频（引擎推理是 CPU 大头，
+          单次 1~10 秒，命中缓存可完全省去）；
         - 并发限流：`max_concurrent_synth`（默认 1，串行）；
         - 排队上限：在途（含等待）数超过 并发上限 + `max_synth_queue` 时直接跳过，
           避免忙时请求无限堆积、语音延迟持续增长。
         """
+        cache_key = self._synth_cache_key(text, style_id)
+        cached = self._synth_cache_get(cache_key)
+        if cached is not None:
+            logger.debug(f"[COEIROINK] 命中合成缓存（{len(text)} 字，style={style_id}）")
+            return cached
+
         global _SYNTH_INFLIGHT
         limit = max(1, int(self._cfg("max_concurrent_synth") or 1))
         max_queue = max(0, int(self._cfg("max_synth_queue") or 0))
@@ -1704,6 +1786,7 @@ class CoeiroinkTTSPlugin(Star):
                     logger.warning("[COEIROINK] 引擎不可用，跳过语音合成")
                     return None
                 sem = get_synth_semaphore(limit)
+                started = time.monotonic()
                 async with sem:
                     path = await synthesize_with_recovery(
                         text,
@@ -1727,6 +1810,11 @@ class CoeiroinkTTSPlugin(Star):
                     )
                 # 合成成功 => 该风格已被引擎加载并常驻内存
                 self._loaded_styles.add(int(style_id))
+                elapsed = time.monotonic() - started
+                logger.debug(
+                    f"[COEIROINK] 合成完成：{len(text)} 字 / {elapsed:.2f}s（style={style_id}）"
+                )
+                self._synth_cache_put(cache_key, path)
                 return path
             except Exception as e:  # noqa: BLE001
                 logger.error(f"[COEIROINK] 合成失败（不影响正常回复）：{e}")
@@ -1734,14 +1822,16 @@ class CoeiroinkTTSPlugin(Star):
         finally:
             _SYNTH_INFLIGHT -= 1
 
-    def _segments(self, text: str) -> list[str]:
+    def _segments(self, text: str, *, already_cleaned: bool = False) -> list[str]:
         """把待合成文本切成若干段（P1-2），返回清洗后的段列表。
 
         - 未超 max_text_length：整段返回；
         - 超长且 skip_if_too_long：返回空（保持原「跳过」语义）；
         - 超长且允许：按句切分，段数超过 `max_synth_segments` 时截断并记日志。
+
+        `already_cleaned=True` 时跳过重复清洗（调用方已 clean_text 过）。
         """
-        cleaned = clean_text(text)
+        cleaned = text if already_cleaned else clean_text(text)
         if not cleaned:
             return []
         max_len = int(self._cfg("max_text_length") or 200)
@@ -1760,9 +1850,11 @@ class CoeiroinkTTSPlugin(Star):
             segments = segments[:max_segments]
         return segments
 
-    async def _synthesize_all(self, text: str, style_id: int) -> list[str]:
+    async def _synthesize_all(
+        self, text: str, style_id: int, *, already_cleaned: bool = False
+    ) -> list[str]:
         """按段合成全部文本，返回音频路径列表（可能为空）。"""
-        segments = self._segments(text)
+        segments = self._segments(text, already_cleaned=already_cleaned)
         if not segments:
             return []
         paths: list[str] = []
@@ -1841,7 +1933,9 @@ class CoeiroinkTTSPlugin(Star):
 
         style_id, _ = self._resolve_style(None)
         # P1-2：长文本按句分段合成，逐段追加语音（保持原文本不变，避免重复发送）
-        paths = await self._synthesize_all(speak_text, style_id)
+        paths = await self._synthesize_all(
+            speak_text, style_id, already_cleaned=(mode == "japanese_only")
+        )
         if not paths:
             return
         for path in paths:
