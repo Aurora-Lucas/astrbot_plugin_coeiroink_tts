@@ -1,7 +1,7 @@
 # Tsukuyomi-chan COEIROINK 日语语音插件 · 结构说明（PLUGIN_STRUCTURE）
 
 > 本文档由代码实地梳理生成，只描述当前源码中**真实存在**的内容。
-> 版本：对应 `metadata.yaml` 的 `1.11.0`（v1.2.0 起插件通用化：不再内置任何机器相关路径；
+> 版本：对应 `metadata.yaml` 的 `1.11.1`（v1.2.0 起插件通用化：不再内置任何机器相关路径；
 > v1.2.1 起显示名改为 Tsukuyomi-chan COEIROINK 日语语音，并附音源/软件致谢；
 > v1.2.2 起补充 Logo 作者声明；v1.2.3 起补充渠道支持说明；
 > v1.3.0 起内置 Web UI 图形化管理面板（可开关，开启后原配置面板仅保留开关）；
@@ -26,7 +26,8 @@
 > 1.8.0 起性能优化：合成结果 LRU 缓存、is_japanese/clean_text 快路径、内存读数与地址校验缓存；
 > 1.9.0 起新增句级缓存（按句/小句复用音频 + ffmpeg 拼接为一条语音，键可忽略结尾标点）；
 > 1.10.0 起新增长期保留池：命中统计 + 定期 LLM 复审晋级，池内音频不受临时清理影响（索引落盘可跨重启）；
-> 1.11.0 起新增调用次数排序算法与超长期池（「排名前 X」或「调用次数 ≥ Y」，tier 独立容量与保留期，LLM 不可用时完全由算法决策）。
+> 1.11.0 起新增调用次数排序算法与超长期池（「排名前 X」或「调用次数 ≥ Y」，tier 独立容量与保留期，LLM 不可用时完全由算法决策）；
+> 1.11.1 起设置页每张卡片补说明文字与逐项提示，「缓存治理」卡片新增实时状态胶囊。
 > 无法从代码/环境中确认的点，统一用「**待确认**」标注，不做臆测。
 
 > ### 🔊 音源与软件致谢
@@ -66,7 +67,7 @@
 
 | 文件 | 职责 |
 | --- | --- |
-| `metadata.yaml` | 插件标识 `name: astrbot_plugin_coeiroink_tts`、`display_name: Tsukuyomi-chan COEIROINK 日语语音`、`version: 1.11.0`、`author: Aurora & deepseek`；市场字段：`repo`（GitHub 地址）、`short_desc`、`support_platforms: [aiocqhttp]`（NapCat/OneBot v11，已实测）、`astrbot_version: ">=4.24.5,<5"`（插件 Pages 最早可用版本）、`category: utilities`、`tags` |
+| `metadata.yaml` | 插件标识 `name: astrbot_plugin_coeiroink_tts`、`display_name: Tsukuyomi-chan COEIROINK 日语语音`、`version: 1.11.1`、`author: Aurora & deepseek`；市场字段：`repo`（GitHub 地址）、`short_desc`、`support_platforms: [aiocqhttp]`（NapCat/OneBot v11，已实测）、`astrbot_version: ">=4.24.5,<5"`（插件 Pages 最早可用版本）、`category: utilities`、`tags` |
 | `main.py` | 全部实现：常量、默认配置、风格归一化、文本清洗、引擎探测/拉起、合成链路、翻译、TTS Provider 适配器、插件主体（自动触发 + 命令 + LLM 工具） |
 | `_conf_schema.json` | 配置项定义，AstrBot 据此渲染配置面板；键名与 `main.py` 中 `DEFAULT_CONFIG` 一一对应 |
 | `README.md` | 用户文档：风格对照、配置方法、单次切换用法、非法值行为、内存提示 |

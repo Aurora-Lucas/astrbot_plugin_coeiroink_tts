@@ -33,6 +33,21 @@
       border-radius: 999px; padding: 7px 18px; font-size: 13px; font-weight: 600; cursor: pointer;
     }
     .tab.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+    .desc { color: var(--muted); font-size: 12.5px; line-height: 1.75; margin: 6px 0 10px; }
+    .desc b { color: var(--text); }
+    .desc.list { margin: 6px 0 10px 18px; padding: 0; }
+    .desc.list li { margin: 2px 0; }
+    .subhead {
+      font-size: 12px; font-weight: 700; color: var(--accent);
+      margin: 14px 0 8px; letter-spacing: .3px;
+    }
+    .hint { display: block; color: var(--muted); font-size: 11.5px; font-weight: 400; margin-top: 2px; line-height: 1.5; }
+    .summary { display: flex; flex-wrap: wrap; gap: 8px; margin: 4px 0 8px; }
+    .chip {
+      background: var(--accent-soft); color: var(--accent);
+      border-radius: 999px; padding: 4px 12px; font-size: 12px; font-weight: 600;
+    }
+    .chip.muted { background: transparent; color: var(--muted); border: 1px solid var(--line); font-weight: 500; }
     .subtabs { display: flex; gap: 6px; margin: 0 0 14px; }
     .subtab {
       border: 1px solid var(--line); background: transparent; color: var(--muted);
@@ -176,6 +191,7 @@
     <div id="panel-settings" hidden>
       <div class="card">
       <h2>基本设置</h2>
+      <p class="desc">触发方式决定机器人<b>什么时候</b>把回复转成语音；默认风格是合成时使用的音色（风格 ID 可在安装向导或引擎的 <b>/v1/speakers</b> 中查看）。</p>
       <div class="fgroup">
         <div class="field check"><input type="checkbox" id="cfg_enabled" /><label for="cfg_enabled">启用插件</label></div>
         <div class="field check"><input type="checkbox" id="cfg_auto_start_engine" /><label for="cfg_auto_start_engine">引擎未运行时自动拉起</label></div>
@@ -191,6 +207,7 @@
 
     <div class="card">
       <h2>引擎连接</h2>
+      <p class="desc">COEIROINK 引擎是一个本机 HTTP 服务（默认 <b>127.0.0.1:50032</b>）。留空的路径项会依次从<b>环境变量</b>与常见安装位置自动推导，通常无需填写。</p>
       <div class="fgroup">
         <div class="field"><label>引擎地址（api_base）</label><input type="text" id="cfg_api_base" /></div>
         <div class="field"><label>说话人 UUID（speaker_uuid）</label><input type="text" id="cfg_speaker_uuid" /></div>
@@ -203,6 +220,7 @@
 
     <div class="card">
       <h2>内存与文本限制</h2>
+      <p class="desc">引擎推理很吃内存：<b>风格一旦加载就常驻内存</b>，并发合成会成倍放大峰值。内存紧张的机器建议保持「最大并发合成数 = 1」并按需调低缓存条数；下方「缓存」相关项与长期保留池共同决定复用效果。</p>
       <div class="fgroup">
         <div class="field"><label>最低可用内存（MB，0=不检查）</label><input type="number" id="cfg_min_available_memory_mb" /></div>
         <div class="field"><label>单次合成最大字数</label><input type="number" id="cfg_max_text_length" /></div>
@@ -220,6 +238,7 @@
 
     <div class="card">
       <h2>安全</h2>
+      <p class="desc">默认只允许连接<b>本机回环地址</b>的引擎，避免回复内容被发送到外部主机；确需连接远程引擎时再逐项放开。</p>
       <div class="fgroup">
         <div class="field check">
           <input type="checkbox" id="cfg_allow_remote_engine" />
@@ -238,6 +257,7 @@
 
     <div class="card">
       <h2>音频与翻译</h2>
+      <p class="desc">控制输出音频格式与「非日语回复」的翻译方式：<b>always_translate</b> 模式下会先用下方系统提示词把文本翻译成日语再合成。</p>
       <div class="fgroup">
         <div class="field"><label>输出采样率（0=引擎默认）</label><input type="number" id="cfg_output_sampling_rate" /></div>
         <div class="field full"><label>ffmpeg 路径（留空自动在 PATH 查找）</label><input type="text" id="cfg_ffmpeg_path" /></div>
@@ -247,23 +267,95 @@
 
     <div class="card">
       <h2>缓存治理（长期保留池）</h2>
+      <p class="desc">
+        语音合成很费 CPU（同一句话约 1~8 秒），所以插件会把合成过的音频按<b>复用价值</b>分层保存，
+        既能秒回常用台词，又不会让长期对话把磁盘占满。
+      </p>
+      <ol class="desc list">
+        <li><b>临时缓存</b>：刚合成的音频，放在系统临时目录，<b>2 小时后自动删除</b>。</li>
+        <li><b>长期保留池</b>：被反复使用的片段晋级到这里，<b>默认保留 30 天</b>，不受临时清理影响。</li>
+        <li><b>超长期保留池</b>：最常用的片段，<b>默认保留 365 天</b>，几乎不会因清理而重新合成。</li>
+      </ol>
+      <p class="desc">
+        <b>谁晋级由两步决定：</b>先把所有片段按「调用次数」排序（排序算法即下面的权重项），
+        满足 <b>①排名前 X</b> <b>或</b> <b>②调用次数 ≥ Y</b>（两个条件满足任意一个即可）→ 进入<b>超长期池</b>；
+        其余达到「晋升门槛」的片段 → 进入<b>长期池</b>。
+        若复审时有可用的对话模型，则由模型在算法建议的基础上做最终决定（提升层级 / 纳入 / 淘汰）；
+        <b>模型不可用时完全按排序算法的结果处理</b>，没有 LLM 也能正常治理。
+        两层各自有容量上限与保留期，超出后按「权重最低、最久未用」优先淘汰。
+      </p>
+      <div class="summary" id="poolSummary">…</div>
+      <p class="desc" id="poolLocation"></p>
+
+      <div class="subhead">① 排序权重与晋级条件</div>
       <div class="fgroup">
-        <div class="field"><label>排序权重算法</label><select id="cfg_phrase_rank_mode"><option value="hits">纯调用次数（推荐）</option><option value="weighted">次数 × 文本长度</option></select></div>
-        <div class="field"><label>超长期池条件①：调用排名前 X（0=关闭）</label><input type="number" id="cfg_phrase_ultra_top_rank" min="0" /></div>
-        <div class="field"><label>超长期池条件②：调用次数 ≥ Y（0=关闭）</label><input type="number" id="cfg_phrase_ultra_min_hits" min="0" /></div>
-        <div class="field"><label>超长期池容量上限（默认 32）</label><input type="number" id="cfg_phrase_ultra_max_entries" min="1" /></div>
-        <div class="field"><label>超长期池保留天数（默认 365，0=永久）</label><input type="number" id="cfg_phrase_ultra_retention_days" min="0" /></div>
-        <div class="field"><label>晋升门槛（命中次数，默认 3）</label><input type="number" id="cfg_phrase_pool_min_hits" min="1" /></div>
-        <div class="field"><label>池容量上限（默认 64）</label><input type="number" id="cfg_phrase_pool_max_entries" min="1" /></div>
-        <div class="field"><label>保留天数（默认 30，0=永久）</label><input type="number" id="cfg_phrase_pool_retention_days" min="0" /></div>
-        <div class="field"><label>复审周期（小时，默认 24）</label><input type="number" id="cfg_phrase_pool_review_hours" min="1" /></div>
-        <div class="field check"><input type="checkbox" id="cfg_phrase_pool_enabled" /><label for="cfg_phrase_pool_enabled">启用长期保留池（高复用片段不受临时清理影响）</label></div>
-        <div class="field check"><input type="checkbox" id="cfg_phrase_pool_llm_review" /><label for="cfg_phrase_pool_llm_review">复审时使用 LLM（无可用模型时自动回退为规则晋升）</label></div>
+        <div class="field">
+          <label>排序权重算法</label>
+          <select id="cfg_phrase_rank_mode"><option value="hits">纯调用次数（推荐）</option><option value="weighted">次数 × 文本长度</option></select>
+          <span class="hint">决定谁排在前面：纯调用次数只按被复用的次数排名；加权模式会让「长文本且被多次复用」的片段更靠前（省下的合成时间更多）。</span>
+        </div>
+        <div class="field">
+          <label>超长期池条件①：调用排名前 X</label>
+          <input type="number" id="cfg_phrase_ultra_top_rank" min="0" />
+          <span class="hint">排名进入前 X 名即进入超长期池，默认 8；填 0 表示不使用该条件。</span>
+        </div>
+        <div class="field">
+          <label>超长期池条件②：调用次数 ≥ Y</label>
+          <input type="number" id="cfg_phrase_ultra_min_hits" min="0" />
+          <span class="hint">被复用次数达到 Y 次即进入超长期池，默认 10；填 0 表示不使用该条件。与条件①是「或」关系。</span>
+        </div>
+        <div class="field">
+          <label>长期池晋升门槛（命中次数）</label>
+          <input type="number" id="cfg_phrase_pool_min_hits" min="1" />
+          <span class="hint">被复用次数达到该值才进入长期池候选，默认 3。命中次数只有 1~2 次的一次性语音不会被保留。</span>
+        </div>
+      </div>
+
+      <div class="subhead">② 容量与保留期</div>
+      <div class="fgroup">
+        <div class="field">
+          <label>长期池容量上限</label>
+          <input type="number" id="cfg_phrase_pool_max_entries" min="1" />
+          <span class="hint">长期池最多保留多少条音频，默认 64；超出时淘汰「权重最低、最久未用」的条目。</span>
+        </div>
+        <div class="field">
+          <label>长期池保留天数</label>
+          <input type="number" id="cfg_phrase_pool_retention_days" min="0" />
+          <span class="hint">多少天未被使用就回收，默认 30；填 0 表示永久保留（不建议）。</span>
+        </div>
+        <div class="field">
+          <label>超长期池容量上限</label>
+          <input type="number" id="cfg_phrase_ultra_max_entries" min="1" />
+          <span class="hint">超长期池最多保留多少条，默认 32。这是控制磁盘占用的第二道闸门。</span>
+        </div>
+        <div class="field">
+          <label>超长期池保留天数</label>
+          <input type="number" id="cfg_phrase_ultra_retention_days" min="0" />
+          <span class="hint">超长期池条目多少天未被使用就回收，默认 365；填 0 表示永久保留。</span>
+        </div>
+      </div>
+
+      <div class="subhead">③ 开关与复审</div>
+      <div class="fgroup">
+        <div class="field">
+          <label>复审周期（小时）</label>
+          <input type="number" id="cfg_phrase_pool_review_hours" min="1" />
+          <span class="hint">后台每隔多久重新排名并调整两层池的内容，默认 24 小时；也可以随时在「监控 → 复审缓存池」手动触发一次。</span>
+        </div>
+        <div class="field check">
+          <input type="checkbox" id="cfg_phrase_pool_enabled" />
+          <label for="cfg_phrase_pool_enabled">启用分层保留（关闭后所有音频只走临时缓存，2 小时后清理）<span class="hint">关闭不会影响合成功能，只是每次都要重新合成。</span></label>
+        </div>
+        <div class="field check">
+          <input type="checkbox" id="cfg_phrase_pool_llm_review" />
+          <label for="cfg_phrase_pool_llm_review">复审时使用 LLM 复核<span class="hint">开启后由当前对话模型在算法建议之上决定保留/淘汰；无可用模型或调用失败时自动改用纯算法结果。</span></label>
+        </div>
       </div>
     </div>
 
     <div class="card">
       <h2>Web UI 管理</h2>
+      <p class="desc">开启后可在本页图形化管理全部配置（原 AstrBot 配置面板只保留 5 个基础项）。关闭开关即恢复原配置面板，本页数据不会被删除。</p>
       <div class="fgroup">
         <div class="field check">
           <input type="checkbox" id="cfg_enable_webui" />
@@ -425,6 +517,37 @@
 
   /* ============ 管理面板 ============ */
 
+  /* 缓存治理卡片：把当前池状态渲染成胶囊，让用户一眼看懂「现在有多少、按什么规则晋级」 */
+  function renderPoolSummary(cfg, status) {
+    const box = $("poolSummary");
+    if (!box) return;
+    const s = status || {};
+    const enabled = cfg.phrase_pool_enabled !== false;
+    const chips = [];
+    if (!enabled) {
+      chips.push('<span class="chip muted">分层保留已关闭：音频只走临时缓存（2 小时后清理）</span>');
+    } else {
+      chips.push(`<span class="chip">长期池 ${s.pool_entries ?? 0} 条</span>`);
+      chips.push(`<span class="chip">超长期池 ${s.pool_ultra_entries ?? 0} 条</span>`);
+      chips.push(`<span class="chip muted">已统计片段 ${s.usage_tracked ?? 0} 条</span>`);
+      chips.push(`<span class="chip muted">权重：${cfg.phrase_rank_mode === "weighted" ? "次数 × 文本长度" : "纯调用次数"}</span>`);
+      const conds = [];
+      if (Number(cfg.phrase_ultra_top_rank ?? 0) > 0) conds.push(`排名前 ${cfg.phrase_ultra_top_rank}`);
+      if (Number(cfg.phrase_ultra_min_hits ?? 0) > 0) conds.push(`调用次数 ≥ ${cfg.phrase_ultra_min_hits}`);
+      chips.push(
+        `<span class="chip muted">进入超长期池：${conds.length ? conds.join(" 或 ") : "两个条件都已关闭"}</span>`
+      );
+    }
+    box.innerHTML = chips.join("");
+    const loc = $("poolLocation");
+    if (loc) {
+      loc.innerHTML =
+        enabled && s.pool_dir
+          ? `存储位置：<code>${s.pool_dir}</code>（插件数据目录，不受临时目录清理影响）`
+          : "";
+    }
+  }
+
   function renderConfig(cfg, status) {
     setCheckbox("cfg_enabled", cfg.enabled);
     setCheckbox("cfg_auto_start_engine", cfg.auto_start_engine);
@@ -466,6 +589,7 @@
     setValue("cfg_phrase_ultra_min_hits", cfg.phrase_ultra_min_hits);
     setValue("cfg_phrase_ultra_max_entries", cfg.phrase_ultra_max_entries);
     setValue("cfg_phrase_ultra_retention_days", cfg.phrase_ultra_retention_days);
+    renderPoolSummary(cfg, status);
     setValue("cfg_output_sampling_rate", cfg.output_sampling_rate);
     setValue("cfg_ffmpeg_path", cfg.ffmpeg_path);
     setValue("cfg_translate_system_prompt", cfg.translate_system_prompt);
