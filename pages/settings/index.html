@@ -207,6 +207,10 @@
         <div class="field"><label>合成排队上限（默认 2；超出即跳过，防止延迟堆积）</label><input type="number" id="cfg_max_synth_queue" min="0" /></div>
         <div class="field"><label>长文本最大分段数（默认 6）</label><input type="number" id="cfg_max_synth_segments" min="1" /></div>
         <div class="field"><label>合成结果缓存条数（0=禁用，默认 32；相同文本直接复用）</label><input type="number" id="cfg_synth_cache_size" min="0" /></div>
+        <div class="field"><label>句级缓存条数（0=禁用，默认 128；按句复用音频）</label><input type="number" id="cfg_phrase_cache_size" min="0" /></div>
+        <div class="field check"><input type="checkbox" id="cfg_phrase_cache_enabled" /><label for="cfg_phrase_cache_enabled">启用句级缓存（多句文本按句复用，拼接为一条语音）</label></div>
+        <div class="field"><label>句级缓存切分粒度</label><select id="cfg_phrase_split_mode"><option value="sentence">按句（推荐）</option><option value="clause">按小句（含逗号，复用率更高）</option></select></div>
+        <div class="field check"><input type="checkbox" id="cfg_phrase_key_ignore_punct" /><label for="cfg_phrase_key_ignore_punct">句级缓存忽略结尾标点（「…ですね。」与「…ですね、」视为同一句）</label></div>
         <div class="field check"><input type="checkbox" id="cfg_skip_if_too_long" /><label for="cfg_skip_if_too_long">超长文本直接跳过（关闭则按句分段朗读）</label></div>
       </div>
     </div>
@@ -427,6 +431,10 @@
     setValue("cfg_max_synth_segments", cfg.max_synth_segments);
     setValue("cfg_style_switch_min_free_mb", cfg.style_switch_min_free_mb);
     setValue("cfg_synth_cache_size", cfg.synth_cache_size);
+    setValue("cfg_phrase_cache_size", cfg.phrase_cache_size);
+    setCheckbox("cfg_phrase_cache_enabled", cfg.phrase_cache_enabled);
+    setValue("cfg_phrase_split_mode", cfg.phrase_split_mode);
+    setCheckbox("cfg_phrase_key_ignore_punct", cfg.phrase_key_ignore_punct);
     setValue("cfg_output_sampling_rate", cfg.output_sampling_rate);
     setValue("cfg_ffmpeg_path", cfg.ffmpeg_path);
     setValue("cfg_translate_system_prompt", cfg.translate_system_prompt);
@@ -563,6 +571,8 @@
       "keep_temp_files", "auto_start_engine", "enable_llm_tool", "enable_webui",
       "engine_start_timeout", "min_available_memory_mb", "max_text_length",
       "max_concurrent_synth", "max_synth_queue", "max_synth_segments", "synth_cache_size",
+      "phrase_cache_enabled", "phrase_cache_size", "phrase_split_mode",
+      "phrase_key_ignore_punct",
       "allow_style_override", "style_switch_min_free_mb", "allow_remote_engine",
       "skip_if_too_long", "api_base", "speaker_uuid", "output_sampling_rate",
       "engine_dir", "engine_bin", "engine_log", "ffmpeg_path",

@@ -35,6 +35,7 @@ def _make_plugin(**overrides):
     plugin._astrbot_config = None
     plugin._loaded_styles = set()
     plugin._synth_cache = OrderedDict()  # 真实类在 __init__ 中初始化
+    plugin._phrase_cache = OrderedDict()
     plugin._bg_tasks = set()
     plugin._warmup_task = None
     plugin._cleanup_task = None
@@ -236,3 +237,152 @@ def test_synth_cache_lru_eviction(tmp_path, monkeypatch):
     assert len(plugin._synth_cache) == 2  # 超过上限淘汰最旧
     asyncio.run(plugin._synth_one("あ", 5))
     assert calls["n"] == 4  # "あ" 已被淘汰 => 重新合成
+
+
+# ---------------------------------------------------------------------------
+# 句级缓存 + 拼接（1.9.0）
+# ---------------------------------------------------------------------------
+
+
+def _stub_phrase_plugin(tmp_path, monkeypatch, **overrides):
+    """构造启用句级缓存的插件实例；合成与拼接均为假实现（可统计调用）。"""
+    cfg = dict(
+        api_base="http://127.0.0.1:50032",
+        max_concurrent_synth=1,
+        max_synth_queue=4,
+        max_text_length=200,
+        skip_if_too_long=True,
+        synth_cache_size=0,  # 关掉整段缓存，单独观察句级复用
+        phrase_cache_enabled=True,
+        phrase_cache_size=32,
+        phrase_split_mode="sentence",
+    )
+    cfg.update(overrides)
+    plugin = _make_plugin(**cfg)
+    calls = {"texts": []}
+    merged = tmp_path / "merged.mp3"
+    merged.write_bytes(b"merged")
+
+    async def fake_ensure_engine():
+        return True
+
+    async def fake_synthesize(text, **kwargs):
+        calls["texts"].append(text)
+        path = tmp_path / f"seg{len(calls['texts'])}.mp3"
+        path.write_bytes(b"x")
+        return str(path)
+
+    async def fake_concat(paths):
+        calls["concat"] = calls.get("concat", 0) + 1
+        return str(merged)
+
+    plugin._ensure_engine = fake_ensure_engine
+    plugin._concat_audio = fake_concat
+    monkeypatch.setattr(m, "synthesize_with_recovery", fake_synthesize)
+    return plugin, calls, merged
+
+
+def test_split_sentences_modes():
+    assert m.split_sentences("你好。世界。", 200) == ["你好。", "世界。"]
+    assert m.split_sentences("你好，世界", 200) == ["你好，世界"]
+    assert m.split_sentences("你好，世界", 200, clause=True) == ["你好，", "世界"]
+    assert m.split_sentences("", 200) == []
+    # 单句超长硬切
+    assert m.split_sentences("あ" * 10 + "。", 4) == ["ああああ", "ああああ", "ああ。"]
+
+
+def test_phrase_cache_reuses_shared_sentence(tmp_path, monkeypatch):
+    plugin, calls, merged = _stub_phrase_plugin(tmp_path, monkeypatch)
+
+    first = asyncio.run(plugin._synthesize_all("おはよう。今日はいい天気ですね。", 5))
+    assert calls["texts"] == ["おはよう。", "今日はいい天気ですね。"]
+    assert first == [str(merged)]  # 拼接成一条语音
+
+    calls["texts"].clear()
+    second = asyncio.run(plugin._synthesize_all("おはよう。明日も晴れるそうです。", 5))
+    assert calls["texts"] == ["明日も晴れるそうです。"]  # 第一句命中，只合成新句
+    assert second == [str(merged)]
+
+
+def test_phrase_cache_single_sentence_unchanged(tmp_path, monkeypatch):
+    plugin, calls, _ = _stub_phrase_plugin(tmp_path, monkeypatch)
+    paths = asyncio.run(plugin._synthesize_all("おはようございます。", 5))
+    assert len(paths) == 1
+    assert calls.get("concat") is None  # 单句不触发拼接
+    assert calls["texts"] == ["おはようございます。"]
+
+
+def test_phrase_cache_disabled_falls_back(tmp_path, monkeypatch):
+    plugin, calls, _ = _stub_phrase_plugin(
+        tmp_path,
+        monkeypatch,
+        phrase_cache_enabled=False,
+        max_text_length=5,
+        skip_if_too_long=False,  # 关闭跳过 => 走旧的分段合成路径
+    )
+    paths = asyncio.run(plugin._synthesize_all("おはよう。いい天気。", 5))
+    assert calls.get("concat") is None  # 不走拼接
+    assert len(paths) == 2  # 退回逐段多条的旧行为
+
+
+def test_phrase_cache_concat_failure_falls_back_to_segments(tmp_path, monkeypatch):
+    plugin, calls, _ = _stub_phrase_plugin(tmp_path, monkeypatch)
+
+    async def failing_concat(paths):
+        return None
+
+    plugin._concat_audio = failing_concat
+    paths = asyncio.run(plugin._synthesize_all("おはよう。いい天気。", 5))
+    assert len(paths) == 2  # 拼接失败 => 逐段发送，不丢语音
+
+
+def test_phrase_cache_lru_eviction(tmp_path, monkeypatch):
+    plugin, calls, _ = _stub_phrase_plugin(tmp_path, monkeypatch, phrase_cache_size=1)
+    asyncio.run(plugin._synthesize_all("ああ。いい。", 5))
+    assert len(plugin._phrase_cache) == 1  # 上限 1，只保留最后一句
+    calls["texts"].clear()
+    asyncio.run(plugin._synthesize_all("ああ。うう。", 5))
+    assert "ああ。" in calls["texts"]  # 已被淘汰 => 重新合成
+
+
+def test_phrase_cache_clause_mode_reuses_clauses(tmp_path, monkeypatch):
+    plugin, calls, _ = _stub_phrase_plugin(
+        tmp_path, monkeypatch, phrase_split_mode="clause", phrase_cache_size=32
+    )
+    asyncio.run(plugin._synthesize_all("こんにちは、いい天気ですね、散歩でも。", 5))
+    assert calls["texts"] == ["こんにちは、", "いい天気ですね、", "散歩でも。"]
+    calls["texts"].clear()
+    asyncio.run(plugin._synthesize_all("こんにちは、また明日。", 5))
+    assert calls["texts"] == ["また明日。"]  # 小句「こんにちは、」命中
+
+
+def test_phrase_key_ignores_trailing_punct():
+    assert m.phrase_key_text("いい天気ですね。") == "いい天気ですね"
+    assert m.phrase_key_text("いい天気ですね、") == "いい天気ですね"
+    assert m.phrase_key_text("テスト") == "テスト"
+
+
+def test_phrase_cache_reuses_across_different_trailing_punct(tmp_path, monkeypatch):
+    """「…ですね。」与「…ですね、」应复用同一段音频（键忽略结尾标点）。"""
+    plugin, calls, _ = _stub_phrase_plugin(
+        tmp_path, monkeypatch, phrase_split_mode="clause", phrase_cache_size=32
+    )
+    asyncio.run(plugin._synthesize_all("おはようございます、いい天気ですね。", 5))
+    assert calls["texts"] == ["おはようございます、", "いい天気ですね。"]
+    calls["texts"].clear()
+    asyncio.run(plugin._synthesize_all("いい天気ですね、散歩に行きましょう。", 5))
+    assert calls["texts"] == ["散歩に行きましょう。"]  # 「いい天気ですね、」命中
+
+
+def test_phrase_cache_exact_punct_mode_when_disabled(tmp_path, monkeypatch):
+    plugin, calls, _ = _stub_phrase_plugin(
+        tmp_path,
+        monkeypatch,
+        phrase_split_mode="clause",
+        phrase_key_ignore_punct=False,
+        phrase_cache_size=32,
+    )
+    asyncio.run(plugin._synthesize_all("おはようございます、いい天気ですね。", 5))
+    calls["texts"].clear()
+    asyncio.run(plugin._synthesize_all("いい天気ですね、散歩に行きましょう。", 5))
+    assert calls["texts"] == ["いい天気ですね、", "散歩に行きましょう。"]  # 标点不同 => 不复用

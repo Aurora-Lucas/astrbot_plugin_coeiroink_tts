@@ -218,5 +218,41 @@
         "type": "int",
         "default": 32,
         "invisible": true
+    },
+    "phrase_cache_enabled": {
+        "description": "启用句级缓存",
+        "hint": "开启后多句文本会按「句」复用音频：已合成过的句子直接取用，只合成新句子，再拼接为一条语音。可显著减少重复内容的引擎推理耗时；代价是每句按独立句合成（韵律与整段一次合成略有差异）。",
+        "type": "bool",
+        "default": true,
+        "invisible": true
+    },
+    "phrase_cache_size": {
+        "description": "句级缓存条数",
+        "hint": "句级缓存的最大条目数（按句存储音频路径）。默认 128；0 表示禁用句级缓存。",
+        "type": "int",
+        "default": 128,
+        "invisible": true
+    },
+    "phrase_split_mode": {
+        "description": "句级缓存切分粒度",
+        "hint": "sentence=按句末标点（。！？!?…）切分；clause=额外在逗号/分号/冒号处切分（复用率更高，但韵律更碎）。仅在启用句级缓存时生效。",
+        "type": "string",
+        "options": [
+            "sentence",
+            "clause"
+        ],
+        "labels": [
+            "按句（推荐）",
+            "按小句（含逗号）"
+        ],
+        "default": "sentence",
+        "invisible": true
+    },
+    "phrase_key_ignore_punct": {
+        "description": "句级缓存忽略结尾标点",
+        "hint": "开启（默认）时，「いい天気ですね。」与「いい天気ですね、」视为同一句，复用同一段音频（复用率更高）；关闭则要求标点完全一致（韵律最贴合）。音频始终按原文合成，只是复用判定忽略结尾标点。",
+        "type": "bool",
+        "default": true,
+        "invisible": true
     }
 }

@@ -117,6 +117,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "max_synth_queue": 2,
     "max_synth_segments": _MAX_SYNTH_SEGMENTS,
     "synth_cache_size": 32,
+    "phrase_cache_enabled": True,
+    "phrase_cache_size": 128,
+    "phrase_split_mode": "sentence",  # sentence=按句；clause=按小句（含逗号）
+    "phrase_key_ignore_punct": True,  # 句级缓存键忽略结尾标点（提升复用率）
     "allow_style_override": True,
     "style_switch_min_free_mb": 800,
     "allow_remote_engine": False,
@@ -349,13 +353,47 @@ def is_japanese(text: str) -> bool:
 
 
 _SENT_ENDERS_RE = re.compile(r"(?<=[。！？!?…])")
+# 小句边界：额外在中文/日文逗号、分号、冒号处切分（用于更激进的句级复用）
+_CLAUSE_ENDERS_RE = re.compile(r"(?<=[。！？!?…、，,；;：:])")
 
 
-def split_text_segments(text: str, max_len: int) -> list[str]:
+# 句级缓存的键归一化：忽略结尾标点，使「同一内容、不同句读」也能复用
+_PHRASE_TAIL_PUNCT_RE = re.compile(r"[。！？!?…、，,；;：:\s]+$")
+
+
+def phrase_key_text(text: str) -> str:
+    """句级缓存用的文本键：去掉结尾标点/空白（音频仍按原文合成）。"""
+    return _PHRASE_TAIL_PUNCT_RE.sub("", text) or text
+
+
+def split_sentences(text: str, max_len: int, *, clause: bool = False) -> list[str]:
+    """按标点边界切句，**不做句子合并**（句级缓存复用需要句级粒度）。
+
+    - `clause=False`：句末标点（。！？!?…）切分；
+    - `clause=True`：额外在 、，,；;：: 处切分（小句级，复用率更高，但韵律更碎）；
+    - 与 max_text_length 无关：短文本同样切句（否则短句永远无法复用）；
+    - 单句超过 max_len 时按 max_len 硬切，不丢内容。
+    """
+    if not text:
+        return []
+    max_len = max(1, int(max_len))
+    pattern = _CLAUSE_ENDERS_RE if clause else _SENT_ENDERS_RE
+    parts = [s for s in pattern.split(text) if s] or [text]
+    out: list[str] = []
+    for part in parts:
+        if len(part) > max_len:
+            out.extend(part[i : i + max_len] for i in range(0, len(part), max_len))
+        else:
+            out.append(part)
+    return out
+
+
+def split_text_segments(text: str, max_len: int, *, merge: bool = True) -> list[str]:
     """把长文本按句末标点（。！？!?…）切分成不超过 max_len 的段落（P1-2）。
 
     - 先按句末标点切句（标点保留在句尾）；
-    - 贪心合并短句，使每段尽量接近但不超 max_len；
+    - `merge=True`（默认）：贪心合并短句，使每段尽量接近但不超 max_len；
+    - `merge=False`：**保持句级粒度**（句级缓存复用需要），每句独立成段；
     - 单句仍超长时按 max_len 硬切为多段，不丢弃内容。
     """
     if not text:
@@ -375,6 +413,9 @@ def split_text_segments(text: str, max_len: int) -> list[str]:
                 segments.append(buf)
                 buf = ""
             segments.extend(s[i : i + max_len] for i in range(0, len(s), max_len))
+            continue
+        if not merge:
+            segments.append(s)
             continue
         if buf and len(buf) + len(s) > max_len:
             segments.append(buf)
@@ -1059,6 +1100,8 @@ class CoeiroinkTTSPlugin(Star):
         self._loaded_styles: set[int] = set()
         # 合成结果 LRU 缓存：相同文本+参数直接复用已生成的音频，省掉数秒的引擎推理
         self._synth_cache: OrderedDict[tuple[Any, ...], str] = OrderedDict()
+        # 句级缓存：按「句子」复用音频，长文本只合成未命中的句子后拼接为一条语音
+        self._phrase_cache: OrderedDict[tuple[Any, ...], str] = OrderedDict()
 
     # ---------------- 配置 ----------------
 
@@ -1267,6 +1310,7 @@ class CoeiroinkTTSPlugin(Star):
             "max_synth_segments",
             "style_switch_min_free_mb",
             "synth_cache_size",
+            "phrase_cache_size",
         }
         float_keys = {"probability", "speedScale"}
         bool_keys = {
@@ -1279,6 +1323,8 @@ class CoeiroinkTTSPlugin(Star):
             "enable_webui",
             "allow_remote_engine",
             "allow_style_override",
+            "phrase_cache_enabled",
+            "phrase_key_ignore_punct",
         }
         # 其余键（mode/style_id/api_base/…）统一按字符串处理
 
@@ -1321,6 +1367,14 @@ class CoeiroinkTTSPlugin(Star):
                 return error_response("style_switch_min_free_mb 必须 ≥ 0", status_code=400)
             if key == "synth_cache_size" and value < 0:
                 return error_response("synth_cache_size 必须 ≥ 0（0=禁用缓存）", status_code=400)
+            if key == "phrase_cache_size" and value < 0:
+                return error_response(
+                    "phrase_cache_size 必须 ≥ 0（0=禁用句级缓存）", status_code=400
+                )
+            if key == "phrase_split_mode" and value not in ("sentence", "clause"):
+                return error_response(
+                    "phrase_split_mode 必须是 sentence 或 clause", status_code=400
+                )
             updated[key] = value
 
         if not updated:
@@ -1753,6 +1807,100 @@ class CoeiroinkTTSPlugin(Star):
         while len(self._synth_cache) > max_size:
             self._synth_cache.popitem(last=False)
 
+    def _phrase_cache_enabled(self) -> bool:
+        return bool(self._cfg("phrase_cache_enabled"))
+
+    def _phrase_cache_lookup_key(self, sentence: str) -> str:
+        """句级缓存的文本键；`phrase_key_ignore_punct` 开启时忽略结尾标点。"""
+        if self._cfg("phrase_key_ignore_punct"):
+            return phrase_key_text(sentence)
+        return sentence
+
+    def _phrase_cache_get(self, sentence: str, style_id: int) -> str | None:
+        """按句查缓存；文件已被临时清理时丢弃该条目。"""
+        key = self._synth_cache_key(self._phrase_cache_lookup_key(sentence), style_id)
+        path = self._phrase_cache.get(key)
+        if not path:
+            return None
+        if os.path.isfile(path):
+            self._phrase_cache.move_to_end(key)
+            return path
+        self._phrase_cache.pop(key, None)
+        return None
+
+    def _phrase_cache_put(self, sentence: str, style_id: int, path: str) -> None:
+        """写入句级缓存，按 `phrase_cache_size` 做 LRU 淘汰（0 表示禁用）。"""
+        max_size = max(0, int(self._cfg("phrase_cache_size") or 0))
+        if max_size <= 0:
+            return
+        key = self._synth_cache_key(self._phrase_cache_lookup_key(sentence), style_id)
+        self._phrase_cache[key] = path
+        self._phrase_cache.move_to_end(key)
+        while len(self._phrase_cache) > max_size:
+            self._phrase_cache.popitem(last=False)
+
+    async def _concat_audio(self, paths: list[str]) -> str | None:
+        """把多段音频拼接为一条（ffmpeg concat demuxer + 重编码）。
+
+        句级复用会产生多段音频，拼接后仍以**一条**语音消息发出。
+        失败返回 None，调用方回退为逐段发送。
+        """
+        if len(paths) < 2:
+            return paths[0] if paths else None
+        ffmpeg = resolve_ffmpeg(self._cfg("ffmpeg_path"))
+        if not ffmpeg:
+            logger.warning("[COEIROINK] 未找到 ffmpeg，无法拼接分段音频，将逐段发送")
+            return None
+        try:
+            out_dir = Path(get_astrbot_temp_path())
+            out_dir.mkdir(parents=True, exist_ok=True)
+            uid = uuid.uuid4().hex[:12]
+            list_path = out_dir / f"coeiroink_{uid}.txt"
+            suffix = Path(paths[0]).suffix.lower()
+            out_path = (
+                out_dir / f"coeiroink_{uid}{suffix if suffix in ('.mp3', '.wav') else '.mp3'}"
+            )
+            # concat demuxer 列表：单引号转义（路径由插件生成，稳妥起见仍转义）
+            list_path.write_text(
+                "".join(
+                    f"file '{p.replace(chr(39), chr(39) + chr(92) + chr(39) + chr(39))}'\n"
+                    for p in paths
+                ),
+                encoding="utf-8",
+            )
+            cmd = [
+                ffmpeg,
+                "-nostdin",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(list_path),
+            ]
+            if str(out_path).lower().endswith(".wav"):
+                cmd += ["-codec:a", "pcm_s16le"]
+            else:
+                cmd += ["-codec:a", "libmp3lame", "-qscale:a", "2"]
+            cmd.append(str(out_path))
+            proc = await asyncio.to_thread(
+                subprocess.run, cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+            _safe_unlink(list_path)
+            if proc.returncode != 0:
+                err = proc.stderr.decode("utf-8", "ignore")[-300:]
+                logger.warning(f"[COEIROINK] 音频拼接失败（{err}），将逐段发送")
+                _safe_unlink(out_path)
+                return None
+            return str(out_path)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"[COEIROINK] 音频拼接异常（{e}），将逐段发送")
+            return None
+
     async def _synth_one(self, text: str, style_id: int) -> str | None:
         """合成单段文本，返回音频路径；不可用时返回 None。
 
@@ -1853,11 +2001,68 @@ class CoeiroinkTTSPlugin(Star):
     async def _synthesize_all(
         self, text: str, style_id: int, *, already_cleaned: bool = False
     ) -> list[str]:
-        """按段合成全部文本，返回音频路径列表（可能为空）。"""
-        segments = self._segments(text, already_cleaned=already_cleaned)
+        """合成整段文本，返回音频路径列表（通常只有一条）。
+
+        流程：
+        1. 清洗 + 长度策略（超长且 `skip_if_too_long` → 直接跳过）；
+        2. **整段精确缓存**（`synth_cache_size`）命中即返回，零引擎调用；
+        3. `phrase_cache_enabled` 时按**句级缓存**（`phrase_cache_size`）逐句查/合成，
+           未命中的句子才调用引擎，最后拼接为**一条**语音；
+        4. 关闭句级缓存时沿用原逻辑：整段或按合并段合成，逐段返回多条语音。
+        """
+        cleaned = text if already_cleaned else clean_text(text)
+        if not cleaned:
+            return []
+        max_len = int(self._cfg("max_text_length") or 200)
+        too_long = len(cleaned) > max_len
+        if too_long and self._cfg("skip_if_too_long"):
+            logger.info(f"[COEIROINK] 文本超过 {max_len} 字，且 skip_if_too_long 开启，跳过合成")
+            return []
+
+        # 整段精确缓存（首层快路径）
+        whole_path = self._synth_cache_get(self._synth_cache_key(cleaned, style_id))
+        if whole_path is not None:
+            logger.debug(f"[COEIROINK] 命中整段缓存（{len(cleaned)} 字）")
+            return [whole_path]
+
+        max_segments = max(1, int(self._cfg("max_synth_segments") or _MAX_SYNTH_SEGMENTS))
+
+        if self._phrase_cache_enabled():
+            clause_mode = str(self._cfg("phrase_split_mode") or "sentence") == "clause"
+            sentences = split_sentences(cleaned, max_len, clause=clause_mode)
+            if len(sentences) <= 1:
+                path = await self._synth_one(cleaned[:max_len], style_id)
+                return [path] if path else []
+            if len(sentences) > max_segments:
+                logger.info(
+                    f"[COEIROINK] 文本过长（{len(cleaned)} 字，切出 {len(sentences)} 句），"
+                    f"仅朗读前 {max_segments} 句"
+                )
+                sentences = sentences[:max_segments]
+            paths: list[str] = []
+            hits = 0
+            for sentence in sentences:
+                cached = self._phrase_cache_get(sentence, style_id)
+                if cached is not None:
+                    hits += 1
+                    paths.append(cached)
+                    continue
+                path = await self._synth_one(sentence, style_id)
+                if path:
+                    self._phrase_cache_put(sentence, style_id, path)
+                    paths.append(path)
+            if hits:
+                logger.debug(f"[COEIROINK] 句级缓存命中 {hits}/{len(sentences)} 句")
+            if not paths:
+                return []
+            merged = await self._concat_audio(paths)
+            return [merged] if merged else paths
+
+        # 未启用句级缓存：沿用原「整段 / 合并分段」逻辑
+        segments = self._segments(cleaned)
         if not segments:
             return []
-        paths: list[str] = []
+        paths = []
         for seg in segments:
             path = await self._synth_one(seg, style_id)
             if path:
