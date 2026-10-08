@@ -1,7 +1,10 @@
-"""COEIROINK 日语语音插件（AstrBot）。
+"""Tsukuyomi-chan COEIROINK 日语语音插件（AstrBot）。
 
 功能：把 AstrBot 的回复文本（必要时先翻译成日语）通过本地 COEIROINK CPU 引擎
 合成为语音，并以 Record 语音消息发出。
+
+音源：月读酱（Tsukuyomi-chan，夢前黎制作，免费音源 https://tyc.rei-yumesaki.net/）
+软件：COEIROINK（シロワニさん制作，免费 TTS https://coeiroink.com/）
 
 引擎默认监听 127.0.0.1:50032，仅本机访问，不对外暴露。
 """
@@ -863,7 +866,7 @@ def _register_tts_provider_adapter() -> None:
 
     register_provider_adapter(
         provider_type_name=_PROVIDER_TYPE_NAME,
-        desc="COEIROINK 日语语音（本地 CPU 引擎）",
+        desc="Tsukuyomi-chan COEIROINK 日语语音（本地 CPU 引擎）",
         provider_type=ProviderType.TEXT_TO_SPEECH,
         default_config_tmpl=dict(_TTS_PROVIDER_DEFAULT_CONFIG),
     )(CoeiroinkTTSProvider)
@@ -878,7 +881,7 @@ _register_tts_provider_adapter()
 
 
 class CoeiroinkTTSPlugin(Star):
-    """COEIROINK 日语语音插件。"""
+    """Tsukuyomi-chan COEIROINK 日语语音插件。"""
 
     def __init__(self, context: Context, config: dict | None = None) -> None:
         super().__init__(context, config)

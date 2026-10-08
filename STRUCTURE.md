@@ -1,8 +1,15 @@
-# COEIROINK 日语语音插件 · 结构说明（PLUGIN_STRUCTURE）
+# Tsukuyomi-chan COEIROINK 日语语音插件 · 结构说明（PLUGIN_STRUCTURE）
 
 > 本文档由代码实地梳理生成，只描述当前源码中**真实存在**的内容。
-> 版本：对应 `metadata.yaml` 的 `v1.2.0`（v1.2.0 起插件通用化：不再内置任何机器相关路径）。
+> 版本：对应 `metadata.yaml` 的 `v1.2.1`（v1.2.0 起插件通用化：不再内置任何机器相关路径；
+> v1.2.1 起显示名改为 Tsukuyomi-chan COEIROINK 日语语音，并附音源/软件致谢）。
 > 无法从代码/环境中确认的点，统一用「**待确认**」标注，不做臆测。
+
+> ### 🔊 音源与软件致谢
+> 本插件所使用的音源是由**夢前黎**制作的**月读酱**（Tsukuyomi-chan），这是一个免费使用的音源，
+> 请大家多多支持作者夢前黎。官网：https://tyc.rei-yumesaki.net/
+> 本插件所使用的软件为 **COEIROINK**，由**シロワニさん**制作，这是一个免费的 TTS 软件，
+> 请大家多多支持シロワニさん。官网以及下载：https://coeiroink.com/
 
 ---
 
@@ -15,7 +22,7 @@
 ├── README.md              # 面向用户/开发者的使用说明（四种触发模式、三种风格、内存提示）
 ├── STRUCTURE.md           # 本文件：插件结构说明
 ├── metadata.yaml          # AstrBot 插件元信息（名称、显示名、版本、作者）
-├── main.py                # 插件全部逻辑（1166 行，单文件实现）
+├── main.py                # 插件全部逻辑（1169 行，单文件实现）
 ├── _conf_schema.json      # AstrBot 插件配置面板 schema（20 个配置项）
 ├── _selftest_synth.py     # 独立自测脚本：绕开 AstrBot 直接调用核心合成函数
 └── __pycache__/           # Python 字节码缓存（main.cpython-312.pyc），运行期自动生成
@@ -23,7 +30,7 @@
 
 | 文件 | 职责 |
 | --- | --- |
-| `metadata.yaml` | 插件标识 `name: astrbot_plugin_coeiroink_tts`、`display_name: COEIROINK 日语语音`、`version: v1.2.0`、`author: 索拉` |
+| `metadata.yaml` | 插件标识 `name: astrbot_plugin_coeiroink_tts`、`display_name: Tsukuyomi-chan COEIROINK 日语语音`、`version: v1.2.1`、`author: 索拉` |
 | `main.py` | 全部实现：常量、默认配置、风格归一化、文本清洗、引擎探测/拉起、合成链路、翻译、TTS Provider 适配器、插件主体（自动触发 + 命令 + LLM 工具） |
 | `_conf_schema.json` | 配置项定义，AstrBot 据此渲染配置面板；键名与 `main.py` 中 `DEFAULT_CONFIG` 一一对应 |
 | `README.md` | 用户文档：风格对照、配置方法、单次切换用法、非法值行为、内存提示 |
