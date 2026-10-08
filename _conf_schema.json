@@ -5,6 +5,12 @@
         "type": "bool",
         "default": true
     },
+    "enable_webui": {
+        "description": "启用 Web UI 管理",
+        "hint": "开启后请到 AstrBot 插件详情页的「插件 Pages」中使用图形化管理面板（配置、状态监控、测试合成）；其余配置项将从本配置面板隐藏，由 Web UI 统一管理。需要重载插件后生效。",
+        "type": "bool",
+        "default": false
+    },
     "mode": {
         "description": "触发模式",
         "hint": "always_translate=每次都把回复翻译成日语并朗读；on_demand=仅在被 /voice、/念 命令或 LLM 工具调用时朗读；probabilistic=按概率随机朗读（概率见下）；japanese_only=仅当回复本身是日语时朗读。",
@@ -21,79 +27,92 @@
             "概率触发",
             "仅日语朗读"
         ],
-        "default": "on_demand"
+        "default": "on_demand",
+        "invisible": true
     },
     "probability": {
         "description": "概率触发阈值",
         "hint": "仅 probabilistic 模式生效。取值范围 0~1，例如 0.3 表示 30% 概率朗读。",
         "type": "float",
-        "default": 0.3
+        "default": 0.3,
+        "invisible": true
     },
     "speedScale": {
         "description": "语速",
         "hint": "COEIROINK 的 speedScale 参数，1.0 为原速，大于 1 更快，小于 1 更慢。",
         "type": "float",
-        "default": 1.0
+        "default": 1.0,
+        "invisible": true
     },
     "enable_mp3": {
         "description": "输出 mp3",
         "hint": "开启后用 ffmpeg 把 wav 转成 mp3 再发送；关闭则直接发送 wav。",
         "type": "bool",
-        "default": true
+        "default": true,
+        "invisible": true
     },
     "keep_temp_files": {
         "description": "保留临时文件",
         "hint": "开启后保留合成产生的中间 wav 文件，便于排查问题；关闭则转码后自动删除。",
         "type": "bool",
-        "default": false
+        "default": false,
+        "invisible": true
     },
     "auto_start_engine": {
         "description": "自动拉起引擎",
         "hint": "检测到 COEIROINK 引擎未运行时自动后台启动。启动失败不会阻塞正常文字回复。",
         "type": "bool",
-        "default": true
+        "default": true,
+        "invisible": true
     },
     "enable_llm_tool": {
         "description": "启用 LLM 工具",
         "hint": "开启后向对话模型注册 coeiroink_speak 工具，模型可在用户要求时主动调用发语音；需重载插件生效。",
         "type": "bool",
-        "default": false
+        "default": false,
+        "invisible": true
     },
     "engine_start_timeout": {
         "description": "引擎启动超时（秒）",
         "hint": "自动拉起引擎后等待其就绪的最长时间，首次冷启动约需 40~60 秒。",
         "type": "int",
-        "default": 90
+        "default": 90,
+        "invisible": true
     },
     "min_available_memory_mb": {
         "description": "最低可用内存 (MB)",
         "hint": "合成前检查 MemAvailable，低于该值就跳过本次语音，避免把引擎和服务器一起逼进 OOM。0 表示不检查。",
         "type": "int",
-        "default": 500
+        "default": 500,
+        "invisible": true
     },
     "max_text_length": {
         "description": "最大合成字数",
         "hint": "超过此长度的文本不合成（或截断，取决于下方选项），避免超长文本拖慢引擎。",
         "type": "int",
-        "default": 200
+        "default": 200,
+        "invisible": true
     },
     "skip_if_too_long": {
         "description": "超长文本跳过",
         "hint": "开启则超长直接跳过；关闭则截断到最大字数后合成。",
         "type": "bool",
-        "default": true
+        "default": true,
+        "invisible": true
     },
     "api_base": {
         "description": "引擎地址",
         "hint": "COEIROINK 引擎 HTTP 地址，默认本机 50032，请勿改为公网地址。",
         "type": "string",
-        "default": "http://127.0.0.1:50032"
+        "default": "http://127.0.0.1:50032",
+        "invisible": true
     },
     "speaker_uuid": {
         "description": "说话人 UUID",
         "hint": "COEIROINK 说话人 UUID，默认 tsukuyomi 的 UUID。",
         "type": "string",
-        "default": "3c37646f-3881-5374-2a83-149267990abc"
+        "default": "3c37646f-3881-5374-2a83-149267990abc",
+        "invisible": true
     },
     "style_id": {
         "description": "默认风格",
@@ -109,42 +128,49 @@
             "温柔（おしとやか）",
             "充满活力（げんき）"
         ],
-        "default": "0"
+        "default": "0",
+        "invisible": true
     },
     "output_sampling_rate": {
         "description": "输出采样率",
         "hint": "0 表示使用引擎默认。一般无需修改。",
         "type": "int",
-        "default": 0
+        "default": 0,
+        "invisible": true
     },
     "engine_dir": {
         "description": "引擎目录",
         "hint": "COEIROINK 引擎根目录（含 engine/engine 可执行文件）。留空时从环境变量 COEIROINK_ENGINE_DIR 读取；仍未配置则无法自动拉起引擎（仅影响自动启动，不影响对已在运行的引擎调用）。Linux 示例：/root/COEIROINK_LINUX_CPU_v.2.13.0；Windows 示例：C:\\COEIROINK_LINUX_CPU_v.2.13.0",
         "type": "string",
-        "default": ""
+        "default": "",
+        "invisible": true
     },
     "engine_bin": {
         "description": "引擎可执行文件",
         "hint": "留空时自动取 <engine_dir>/engine/engine（Windows 为 engine.exe）。若引擎可执行文件在别处，填绝对路径或相对 engine_dir 的路径；也可用环境变量 COEIROINK_ENGINE_BIN 指定。",
         "type": "string",
-        "default": ""
+        "default": "",
+        "invisible": true
     },
     "engine_log": {
         "description": "引擎日志路径",
         "hint": "自动拉起引擎时，其标准输出/错误重定向到的日志文件。留空时自动取 <engine_dir>/engine.log（兜底 AstrBot 临时目录）；也可用环境变量 COEIROINK_ENGINE_LOG 指定。",
         "type": "string",
-        "default": ""
+        "default": "",
+        "invisible": true
     },
     "ffmpeg_path": {
         "description": "ffmpeg 路径",
         "hint": "wav 转 mp3 使用的 ffmpeg 可执行文件。留空时自动在系统 PATH 中查找 ffmpeg；也可用环境变量 COEIROINK_FFMPEG 指定。找不到时会给出明确报错提示。",
         "type": "string",
-        "default": ""
+        "default": "",
+        "invisible": true
     },
     "translate_system_prompt": {
         "description": "翻译系统提示词",
         "hint": "把文本翻译成日语时使用的系统提示词，要求模型只输出日语译文。",
         "type": "string",
-        "default": "你是一个专业的翻译引擎。请把用户给出的文本翻译成自然、口语化的日语。只输出日语译文本身，不要输出任何解释、罗马音、拼音、引号、标注或额外文字。如果原文已经是日语，则原样输出。"
+        "default": "你是一个专业的翻译引擎。请把用户给出的文本翻译成自然、口语化的日语。只输出日语译文本身，不要输出任何解释、罗马音、拼音、引号、标注或额外文字。如果原文已经是日语，则原样输出。",
+        "invisible": true
     }
 }

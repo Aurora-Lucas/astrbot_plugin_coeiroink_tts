@@ -1,9 +1,10 @@
 # Tsukuyomi-chan COEIROINK 日语语音插件 · 结构说明（PLUGIN_STRUCTURE）
 
 > 本文档由代码实地梳理生成，只描述当前源码中**真实存在**的内容。
-> 版本：对应 `metadata.yaml` 的 `v1.2.3`（v1.2.0 起插件通用化：不再内置任何机器相关路径；
+> 版本：对应 `metadata.yaml` 的 `v1.3.0`（v1.2.0 起插件通用化：不再内置任何机器相关路径；
 > v1.2.1 起显示名改为 Tsukuyomi-chan COEIROINK 日语语音，并附音源/软件致谢；
-> v1.2.2 起补充 Logo 作者声明；v1.2.3 起补充渠道支持说明）。
+> v1.2.2 起补充 Logo 作者声明；v1.2.3 起补充渠道支持说明；
+> v1.3.0 起内置 Web UI 图形化管理面板（可开关，开启后原配置面板仅保留开关）。
 > 无法从代码/环境中确认的点，统一用「**待确认**」标注，不做臆测。
 
 > ### 🔊 音源与软件致谢
@@ -24,15 +25,17 @@
 ├── README.md              # 面向用户/开发者的使用说明（四种触发模式、三种风格、内存提示）
 ├── STRUCTURE.md           # 本文件：插件结构说明
 ├── metadata.yaml          # AstrBot 插件元信息（名称、显示名、版本、作者）
-├── main.py                # 插件全部逻辑（1169 行，单文件实现）
-├── _conf_schema.json      # AstrBot 插件配置面板 schema（20 个配置项）
+├── main.py                # 插件全部逻辑（1354 行，单文件实现）
+├── _conf_schema.json      # AstrBot 插件配置面板 schema（22 个配置项；除 enabled/enable_webui 外均 invisible，由 Web UI 管理）
 ├── _selftest_synth.py     # 独立自测脚本：绕开 AstrBot 直接调用核心合成函数
+├── pages/                 # 内置 Web UI（AstrBot 插件 Pages）
+│   └── settings/          # 管理面板 Page（index.html + assets/logo.png）
 └── __pycache__/           # Python 字节码缓存（main.cpython-312.pyc），运行期自动生成
 ```
 
 | 文件 | 职责 |
 | --- | --- |
-| `metadata.yaml` | 插件标识 `name: astrbot_plugin_coeiroink_tts`、`display_name: Tsukuyomi-chan COEIROINK 日语语音`、`version: v1.2.3`、`author: 索拉` |
+| `metadata.yaml` | 插件标识 `name: astrbot_plugin_coeiroink_tts`、`display_name: Tsukuyomi-chan COEIROINK 日语语音`、`version: v1.3.0`、`author: 索拉` |
 | `main.py` | 全部实现：常量、默认配置、风格归一化、文本清洗、引擎探测/拉起、合成链路、翻译、TTS Provider 适配器、插件主体（自动触发 + 命令 + LLM 工具） |
 | `_conf_schema.json` | 配置项定义，AstrBot 据此渲染配置面板；键名与 `main.py` 中 `DEFAULT_CONFIG` 一一对应 |
 | `README.md` | 用户文档：风格对照、配置方法、单次切换用法、非法值行为、内存提示 |
@@ -57,7 +60,7 @@
 - `_LLM_TOOL_NAME` = `coeiroink_speak`
 - 环境变量名常量：`ENV_ENGINE_DIR`（`COEIROINK_ENGINE_DIR`）、`ENV_ENGINE_BIN`（`COEIROINK_ENGINE_BIN`）、`ENV_ENGINE_LOG`（`COEIROINK_ENGINE_LOG`）、`ENV_FFMPEG`（`COEIROINK_FFMPEG`）
 - 模块级 `_ENGINE_START_LOCK`（`asyncio.Lock`）、`_ENGINE_PROCESS`（`subprocess.Popen`）：防止并发重复拉起引擎
-- `DEFAULT_CONFIG`：插件默认配置字典（键与 `_conf_schema.json` 对应，共 20 项）
+- `DEFAULT_CONFIG`：插件默认配置字典（键与 `_conf_schema.json` 对应，共 22 项；含 `enable_webui`）
 - 通用解析函数（环境相关路径统一走「配置项 → 环境变量 → 自动推导」）：
   - `resolve_engine_dir(cfg) -> str`：引擎根目录（配置 > `COEIROINK_ENGINE_DIR`）
   - `resolve_engine_bin(engine_dir, cfg) -> str | None`：引擎可执行文件（配置/环境变量 > `<engine_dir>/engine/engine`，Windows 为 `engine.exe`；相对路径按相对引擎目录解释）
@@ -107,8 +110,8 @@
 - `_register_tts_provider_adapter()`：**幂等**注册适配器。因 AstrBot 热重载只清 `sys.modules`/handlers/平台适配器，不清 provider 注册表，故不用装饰器，改为显式调 `register_provider_adapter(...)(CoeiroinkTTSProvider)`；已注册时只刷新类引用。模块导入时立即执行。
 
 ### 2.7 插件主体 `class CoeiroinkTTSPlugin(Star)`
-- `__init__(context, config)`：合并 `DEFAULT_CONFIG` 与传入 config（值为 `None` 的项不覆盖）
-- `initialize()`：若开启 `auto_start_engine` 则创建预热任务 `_warm_up_engine`；并按需注册 LLM 工具
+- `__init__(context, config)`：合并 `DEFAULT_CONFIG` 与传入 config（值为 `None` 的项不覆盖）；保留 `AstrBotConfig` 引用到 `self._astrbot_config`（含 `save_config_async()`，供 Web UI 写回配置）
+- `initialize()`：若开启 `auto_start_engine` 则创建预热任务 `_warm_up_engine`；注册 LLM 工具与 **Web UI 后端接口**
 - `terminate()`：取消未完成的预热任务，并 `close_http_client()` 释放共享 HTTP 连接池
 - `_warm_up_engine()`：`try/except` 包裹 `_ensure_engine`，失败仅告警，不影响正常回复
 - `_register_llm_tools_if_needed()`：幂等注册 LLM 工具 `coeiroink_speak`（仅当 `enable_llm_tool` 为真）
@@ -116,8 +119,16 @@
 - `_resolve_style(override) -> (style_id, error)`：决定本次合成 styleId。`override` 非空视为显式指定，非法则返回错误提示（**不回退**）；`override` 为空用配置默认值，配置非法则告警并回退 `DEFAULT_STYLE_ID`
 - `_synthesize(text, style_id) -> str | None`：清洗文本 → 长度校验 → 确保引擎 → `synthesize_with_recovery`（带 `min_available_mb` 门槛）；不可用返回 `None`
 - `_to_japanese(text, umo)`：调用 `translate_to_japanese`
+- **Web UI（插件 Pages）**：
+  - `_webui_enabled()`：读取 `enable_webui` 配置
+  - `_register_web_apis()`：`context.register_web_api` 注册 4 条路由（前缀 `/{_PLUGIN_NAME}`，`_PLUGIN_NAME` 与 metadata 的 name 一致）：`GET/POST /config`、`GET /status`、`POST /test`；框架对同路由同方法幂等（自动替换），热重载安全
+  - `_save_config() -> bool`：把 `self.config` 经 `AstrBotConfig.save_config_async()` 写回配置文件（不阻塞事件循环）
+  - `_webui_get_config()`：返回当前配置 + 风格/模式选项表
+  - `_webui_save_config()`：只接受已知键，按 int/float/bool/str 类型收敛；`mode` 必须在 `VALID_MODES` 内、`style_id` 必须可归一化；非法值返回 400 错误响应（`astrbot.api.web` 的 `request / json_response / error_response`）
+  - `_webui_status()`：引擎探活、可用内存、当前风格、引擎进程 PID、解析后的 engine_bin/ffmpeg 等
+  - `_webui_test_synth()`：`enable_webui` 关闭时返回 403；否则按当前配置合成一句测试语音（已是日语则跳过翻译）
 
-### 2.8 三处对外入口
+### 2.8 对外入口
 1. **自动触发** `@filter.on_decorating_result()` → `on_decorating_result(event)`
    - 仅 `always_translate / probabilistic / japanese_only` 三种模式生效（`on_demand` 直接返回）
    - 取 `event.get_result()` 纯文本，清洗后按模式决定 `speak_text`，再把 `Record(file, url, text)` **追加**到即将发送的消息链（不改动原文本，避免重复发送）
@@ -128,6 +139,7 @@
 3. **LLM 工具** `coeiroink_speak` → `_llm_tool_handler(event, text, style=None)`
    - 参数：`text`（必填）、`style`（可选，本次朗读临时风格）
    - （已是日语则跳过翻译）翻译 → 合成 → `event.send(MessageChain([Record(...)]))`，返回「已发送语音。」
+4. **Web UI Pages**：`pages/settings/index.html`（单文件自包含页面，通过 `window.AstrBotPluginPage` bridge 与后端通信，支持暗色主题）；后端为上面 2.7 的 Web API 路由
 
 ---
 
@@ -151,6 +163,7 @@
 | 键名 | 类型 | 默认值 | 作用 |
 | --- | --- | --- | --- |
 | `enabled` | bool | `true` | 启用插件；关闭后不参与自动触发与命令 |
+| `enable_webui` | bool | `false` | 启用内置 Web UI 管理面板（开启后其余配置项由 Web UI 管理，见下方说明） |
 | `mode` | string | `on_demand` | 触发模式：`always_translate`（总是翻译朗读）/ `on_demand`（仅命令/工具触发）/ `probabilistic`（概率）/ `japanese_only`（仅日语朗读） |
 | `probability` | float | `0.3` | 仅 `probabilistic` 模式生效，0~1 |
 | `speedScale` | float | `1.0` | 语速，1.0 原速 |
@@ -171,6 +184,10 @@
 | `engine_log` | string | `""` | 自动拉起引擎时的 stdout/stderr 重定向目标；留空自动取 `<engine_dir>/engine.log` |
 | `ffmpeg_path` | string | `""` | wav→mp3 用的 ffmpeg；留空自动在 PATH 中查找 |
 | `translate_system_prompt` | string | 见下 | 翻译成日语时使用的系统提示词 |
+
+> **Web UI 开关**：`enable_webui`（bool，默认 `false`）。开启后请用插件 Pages 管理全部配置；
+> 因此 schema 中除 `enabled` 与 `enable_webui` 外的所有配置项都标记了 `"invisible": true`
+> ——原配置面板只保留这两个开关，其余项在面板上隐藏（值仍保存在配置文件中，由 Web UI 读写）。
 
 `translate_system_prompt` 默认值：
 > 你是一个专业的翻译引擎。请把用户给出的文本翻译成自然、口语化的日语。只输出日语译文本身，不要输出任何解释、罗马音、拼音、引号、标注或额外文字。如果原文已经是日语，则原样输出。
@@ -252,6 +269,7 @@
 4. **TTS Provider 适配器**：`register_provider_adapter(provider_type_name="coeiroink_tts", provider_type=ProviderType.TEXT_TO_SPEECH, ...)(CoeiroinkTTSProvider)`，供 AstrBot 统一 TTS 链路调用。
    - **注意**：当前 `cmd_config.json` 的 `provider_tts_settings.enable=false`、`provider_id=""`，即 AstrBot 全局 TTS 开关是关闭的；插件目前实际靠 `on_decorating_result` 钩子与命令/工具发语音。Provider 适配器已注册可被选用，但未在 provider 列表实例化。
 5. **渠道支持**：本插件可以联动 **NapCat** 使用 QQ 语音；其他渠道暂未测试。如在其他渠道测试过，请提供测试环境及日志，提交报告到 GitHub：https://github.com/Aurora-Lucas/astrbot_plugin_coeiroink_tts/issues
+6. **Web UI（插件 Pages）**：`pages/settings/index.html` 由 Dashboard 以受限 iframe 加载，页面脚本经 `window.AstrBotPluginPage` bridge 调用后端；bridge 端点（不含插件名）由 Dashboard 转发到 `/api/v1/plugins/extensions/<plugin_name>/…`，再匹配 `context.register_web_api` 注册的路由（见 2.7）。启用开关为配置项 `enable_webui`。
 
 ---
 

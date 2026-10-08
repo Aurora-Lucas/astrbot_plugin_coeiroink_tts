@@ -1,0 +1,395 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Tsukuyomi-chan COEIROINK 管理面板</title>
+  <style>
+    :root {
+      --bg: #f7f6fb;
+      --card: #ffffff;
+      --text: #26263a;
+      --muted: #7a7a92;
+      --line: #e6e4f0;
+      --accent: #e86a9c;
+      --accent-soft: #fdeef4;
+      --ok: #2fa46e;
+      --err: #d64545;
+      --warn-bg: #fff6e0;
+      --warn-line: #eccf8f;
+    }
+    [data-theme="dark"] {
+      --bg: #17171f;
+      --card: #22222c;
+      --text: #e8e8f0;
+      --muted: #9a9ab0;
+      --line: #34344a;
+      --accent: #f08ab4;
+      --accent-soft: #3a2430;
+      --warn-bg: #332c1a;
+      --warn-line: #8a742f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+      font-size: 14px;
+      line-height: 1.6;
+    }
+    .wrap { max-width: 860px; margin: 0 auto; padding: 24px 16px 48px; }
+    header { display: flex; align-items: center; gap: 14px; margin-bottom: 18px; }
+    header img { width: 56px; height: 56px; border-radius: 14px; }
+    header h1 { font-size: 20px; margin: 0; }
+    header .sub { color: var(--muted); font-size: 12px; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 16px 18px;
+      margin-bottom: 16px;
+    }
+    .card h2 { margin: 0 0 12px; font-size: 15px; display: flex; align-items: center; gap: 8px; }
+    .badge {
+      font-size: 11px; padding: 2px 8px; border-radius: 999px;
+      background: var(--accent-soft); color: var(--accent); font-weight: 600;
+    }
+    .status-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+    .stat { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; background: var(--bg); }
+    .stat .k { color: var(--muted); font-size: 12px; }
+    .stat .v { font-size: 15px; font-weight: 600; margin-top: 2px; word-break: break-all; }
+    .stat .v.ok { color: var(--ok); }
+    .stat .v.bad { color: var(--err); }
+    .banner {
+      border: 1px solid var(--warn-line); background: var(--warn-bg);
+      border-radius: 12px; padding: 14px 18px; margin-bottom: 16px;
+      display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between;
+    }
+    .banner p { margin: 0; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px 18px; }
+    .field { display: flex; flex-direction: column; gap: 4px; }
+    .field.full { grid-column: 1 / -1; }
+    .field label { font-size: 13px; color: var(--muted); }
+    .field.check { flex-direction: row; align-items: center; gap: 8px; }
+    .field.check label { color: var(--text); }
+    input[type="text"], input[type="number"], select, textarea {
+      width: 100%; padding: 8px 10px; border: 1px solid var(--line);
+      border-radius: 8px; background: var(--bg); color: var(--text); font-size: 13px;
+    }
+    textarea { min-height: 90px; resize: vertical; font-family: inherit; }
+    input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--accent); }
+    input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: 0; border-color: transparent; }
+    button {
+      border: none; border-radius: 8px; padding: 9px 18px; font-size: 13px; font-weight: 600;
+      cursor: pointer; background: var(--accent); color: #fff; transition: opacity .15s;
+    }
+    button:hover { opacity: .88; }
+    button.ghost { background: transparent; border: 1px solid var(--accent); color: var(--accent); }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
+    .testrow { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    .testrow input[type="text"] { flex: 1; min-width: 220px; }
+    #toast {
+      position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%);
+      background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+      padding: 10px 18px; max-width: 90%; box-shadow: 0 6px 24px rgba(0,0,0,.18);
+      display: none; z-index: 9; font-size: 13px;
+    }
+    #toast.ok { border-color: var(--ok); color: var(--ok); display: block; }
+    #toast.err { border-color: var(--err); color: var(--err); display: block; }
+    #testResult { white-space: pre-wrap; word-break: break-all; color: var(--muted); font-size: 12px; margin-top: 8px; }
+    footer { color: var(--muted); font-size: 12px; margin-top: 26px; text-align: center; }
+    footer a { color: var(--accent); text-decoration: none; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <img src="./assets/logo.png" alt="Tsukuyomi-chan" />
+    <div>
+      <h1>Tsukuyomi-chan COEIROINK 日语语音</h1>
+      <div class="sub">AstrBot 插件 · 图形化管理面板</div>
+    </div>
+  </header>
+
+  <div id="webuiBanner" class="banner" style="display:none">
+    <p><b>Web UI 管理未启用。</b>启用后，插件配置请在本页管理（原配置面板仅保留开关）。</p>
+    <button id="enableWebuiBtn">启用 Web UI 管理</button>
+  </div>
+
+  <div class="card">
+    <h2>运行状态 <span class="badge" id="webuiStateBadge">…</span></h2>
+    <div class="status-grid">
+      <div class="stat"><div class="k">插件启用</div><div class="v" id="stPlugin">…</div></div>
+      <div class="stat"><div class="k">引擎</div><div class="v" id="stEngine">…</div></div>
+      <div class="stat"><div class="k">可用内存</div><div class="v" id="stMem">…</div></div>
+      <div class="stat"><div class="k">当前风格</div><div class="v" id="stStyle">…</div></div>
+      <div class="stat"><div class="k">ffmpeg</div><div class="v" id="stFfmpeg">…</div></div>
+      <div class="stat"><div class="k">引擎进程</div><div class="v" id="stPid">…</div></div>
+    </div>
+    <div class="actions">
+      <button class="ghost" id="refreshStatusBtn">刷新状态</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>基本设置</h2>
+    <div class="grid">
+      <div class="field check"><input type="checkbox" id="cfg_enabled" /><label for="cfg_enabled">启用插件</label></div>
+      <div class="field check"><input type="checkbox" id="cfg_auto_start_engine" /><label for="cfg_auto_start_engine">引擎未运行时自动拉起</label></div>
+      <div class="field"><label>触发模式</label><select id="cfg_mode"></select></div>
+      <div class="field"><label>默认风格</label><select id="cfg_style_id"></select></div>
+      <div class="field"><label>概率触发阈值（probability）</label><input type="number" id="cfg_probability" step="0.05" min="0" max="1" /></div>
+      <div class="field"><label>语速（speedScale）</label><input type="number" id="cfg_speedScale" step="0.1" /></div>
+      <div class="field check"><input type="checkbox" id="cfg_enable_mp3" /><label for="cfg_enable_mp3">输出 mp3（关闭则发 wav）</label></div>
+      <div class="field check"><input type="checkbox" id="cfg_keep_temp_files" /><label for="cfg_keep_temp_files">保留临时文件</label></div>
+      <div class="field check"><input type="checkbox" id="cfg_enable_llm_tool" /><label for="cfg_enable_llm_tool">启用 LLM 工具（重载插件生效）</label></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>引擎连接</h2>
+    <div class="grid">
+      <div class="field"><label>引擎地址（api_base）</label><input type="text" id="cfg_api_base" /></div>
+      <div class="field"><label>说话人 UUID（speaker_uuid）</label><input type="text" id="cfg_speaker_uuid" /></div>
+      <div class="field full"><label>引擎目录（engine_dir，留空读环境变量 COEIROINK_ENGINE_DIR）</label><input type="text" id="cfg_engine_dir" /></div>
+      <div class="field full"><label>引擎可执行文件（engine_bin，留空自动推导 engine/engine 或 engine.exe）</label><input type="text" id="cfg_engine_bin" /></div>
+      <div class="field full"><label>引擎日志（engine_log，留空自动取 engine_dir/engine.log）</label><input type="text" id="cfg_engine_log" /></div>
+      <div class="field"><label>引擎启动超时（秒）</label><input type="number" id="cfg_engine_start_timeout" /></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>内存与文本限制</h2>
+    <div class="grid">
+      <div class="field"><label>最低可用内存（MB，0=不检查）</label><input type="number" id="cfg_min_available_memory_mb" /></div>
+      <div class="field"><label>单次合成最大字数</label><input type="number" id="cfg_max_text_length" /></div>
+      <div class="field check"><input type="checkbox" id="cfg_skip_if_too_long" /><label for="cfg_skip_if_too_long">超长文本直接跳过（否则截断）</label></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>音频与翻译</h2>
+    <div class="grid">
+      <div class="field"><label>输出采样率（0=引擎默认）</label><input type="number" id="cfg_output_sampling_rate" /></div>
+      <div class="field full"><label>ffmpeg 路径（留空自动在 PATH 查找）</label><input type="text" id="cfg_ffmpeg_path" /></div>
+      <div class="field full"><label>翻译系统提示词</label><textarea id="cfg_translate_system_prompt"></textarea></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Web UI 管理</h2>
+    <div class="grid">
+      <div class="field check">
+        <input type="checkbox" id="cfg_enable_webui" />
+        <label for="cfg_enable_webui">启用 Web UI 管理（开启后请在本页管理配置，原配置面板仅保留此开关与插件启用开关）</label>
+      </div>
+    </div>
+  </div>
+
+  <div class="actions">
+    <button id="saveBtn">保存配置</button>
+    <button class="ghost" id="reloadBtn">重新加载</button>
+  </div>
+
+  <div class="card">
+    <h2>测试合成</h2>
+    <div class="testrow">
+      <input type="text" id="testText" placeholder="测试文本（留空用默认日语）" />
+      <select id="testStyle"><option value="">使用默认风格</option></select>
+      <button id="testBtn">合成测试语音</button>
+    </div>
+    <div id="testResult"></div>
+  </div>
+
+  <footer>
+    音源：月读酱（Tsukuyomi-chan）by 夢前黎 · <a href="https://tyc.rei-yumesaki.net/" target="_blank" rel="noopener">https://tyc.rei-yumesaki.net/</a><br/>
+    软件：COEIROINK by シロワニさん · <a href="https://coeiroink.com/" target="_blank" rel="noopener">https://coeiroink.com/</a><br/>
+    Logo：ノザラシ · <a href="https://seiga.nicovideo.jp/seiga/im11798588" target="_blank" rel="noopener">https://seiga.nicovideo.jp/seiga/im11798588</a>
+  </footer>
+</div>
+
+<div id="toast"></div>
+
+<script type="module">
+  const bridge = window.AstrBotPluginPage;
+  const $ = (id) => document.getElementById(id);
+  let toastTimer = null;
+
+  function toast(msg, ok = true) {
+    const el = $("toast");
+    el.textContent = msg;
+    el.className = ok ? "ok" : "err";
+    el.style.display = "block";
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { el.style.display = "none"; }, 3500);
+  }
+
+  function setCheckbox(id, value) {
+    $(id).checked = value === true || value === "true" || value === 1;
+  }
+
+  function setValue(id, value) {
+    const el = $(id);
+    if (el.type === "checkbox") { setCheckbox(id, value); return; }
+    el.value = value === null || value === undefined ? "" : String(value);
+  }
+
+  function renderConfig(cfg, status) {
+    setCheckbox("cfg_enabled", cfg.enabled);
+    setCheckbox("cfg_auto_start_engine", cfg.auto_start_engine);
+    setCheckbox("cfg_enable_mp3", cfg.enable_mp3);
+    setCheckbox("cfg_keep_temp_files", cfg.keep_temp_files);
+    setCheckbox("cfg_enable_llm_tool", cfg.enable_llm_tool);
+    setCheckbox("cfg_skip_if_too_long", cfg.skip_if_too_long);
+    setCheckbox("cfg_enable_webui", cfg.enable_webui);
+    setValue("cfg_mode", cfg.mode);
+    setValue("cfg_probability", cfg.probability);
+    setValue("cfg_speedScale", cfg.speedScale);
+    setValue("cfg_api_base", cfg.api_base);
+    setValue("cfg_speaker_uuid", cfg.speaker_uuid);
+    setValue("cfg_engine_dir", cfg.engine_dir);
+    setValue("cfg_engine_bin", cfg.engine_bin);
+    setValue("cfg_engine_log", cfg.engine_log);
+    setValue("cfg_engine_start_timeout", cfg.engine_start_timeout);
+    setValue("cfg_min_available_memory_mb", cfg.min_available_memory_mb);
+    setValue("cfg_max_text_length", cfg.max_text_length);
+    setValue("cfg_output_sampling_rate", cfg.output_sampling_rate);
+    setValue("cfg_ffmpeg_path", cfg.ffmpeg_path);
+    setValue("cfg_translate_system_prompt", cfg.translate_system_prompt);
+    // 风格下拉：用运行状态返回的已归一化 styleId 选中
+    setValue("cfg_style_id", String(status.style_id ?? 0));
+  }
+
+  function renderStatus(status) {
+    $("stPlugin").textContent = status.plugin_enabled ? "已启用" : "已禁用";
+    $("stPlugin").className = "v " + (status.plugin_enabled ? "ok" : "bad");
+    const engEl = $("stEngine");
+    engEl.textContent = status.engine_alive ? "运行中" : "未运行";
+    engEl.className = "v " + (status.engine_alive ? "ok" : "bad");
+    $("stMem").textContent = status.mem_available_mb == null
+      ? "未知" : `${Math.round(status.mem_available_mb)} MB${status.mem_available_mb < status.min_available_memory_mb ? " ⚠低于门槛" : ""}`;
+    $("stStyle").textContent = status.style_label || String(status.style_id ?? "-");
+    $("stFfmpeg").textContent = status.ffmpeg || "未找到";
+    $("stFfmpeg").className = "v " + (status.ffmpeg ? "ok" : "bad");
+    $("stPid").textContent = status.engine_pid == null ? "无（由插件拉起时显示）" : `PID ${status.engine_pid}`;
+    const badge = $("webuiStateBadge");
+    badge.textContent = status.webui_enabled ? "Web UI 已启用" : "Web UI 未启用";
+    $("webuiBanner").style.display = status.webui_enabled ? "none" : "flex";
+  }
+
+  function fillSelects(meta) {
+    const modeSel = $("cfg_mode");
+    modeSel.innerHTML = "";
+    (meta.modes || []).forEach((m) => {
+      const opt = document.createElement("option");
+      opt.value = m.value; opt.textContent = m.label;
+      modeSel.appendChild(opt);
+    });
+    const styleSel = $("cfg_style_id");
+    const testStyle = $("testStyle");
+    styleSel.innerHTML = ""; testStyle.innerHTML = "";
+    const keep = document.createElement("option");
+    keep.value = ""; keep.textContent = "使用默认风格";
+    testStyle.appendChild(keep);
+    (meta.styles || []).forEach((s) => {
+      const opt = document.createElement("option");
+      opt.value = String(s.id); opt.textContent = s.label;
+      styleSel.appendChild(opt);
+      const opt2 = document.createElement("option");
+      opt2.value = String(s.id); opt2.textContent = s.label;
+      testStyle.appendChild(opt2);
+    });
+  }
+
+  async function loadAll() {
+    try {
+      const [configData, status] = await Promise.all([
+        bridge.apiGet("config"),
+        bridge.apiGet("status"),
+      ]);
+      fillSelects(configData);
+      renderConfig(configData.config || {}, status);
+      renderStatus(status);
+    } catch (e) {
+      toast("加载失败：" + e.message, false);
+    }
+  }
+
+  async function refreshStatus() {
+    try { renderStatus(await bridge.apiGet("status")); } catch (e) {
+      toast("刷新状态失败：" + e.message, false);
+    }
+  }
+
+  async function saveConfig() {
+    const keys = [
+      "enabled", "mode", "probability", "style_id", "speedScale", "enable_mp3",
+      "keep_temp_files", "auto_start_engine", "enable_llm_tool", "enable_webui",
+      "engine_start_timeout", "min_available_memory_mb", "max_text_length",
+      "skip_if_too_long", "api_base", "speaker_uuid", "output_sampling_rate",
+      "engine_dir", "engine_bin", "engine_log", "ffmpeg_path",
+      "translate_system_prompt",
+    ];
+    const body = {};
+    for (const key of keys) {
+      const el = $("cfg_" + key);
+      if (!el) continue;
+      if (el.type === "checkbox") { body[key] = el.checked; continue; }
+      if (el.type === "number") { body[key] = el.value === "" ? null : Number(el.value); continue; }
+      body[key] = el.value.trim();
+    }
+    $("saveBtn").disabled = true;
+    try {
+      const res = await bridge.apiPost("config", body);
+      toast(res.saved ? `已保存 ${res.changed.length} 项配置` : "没有可保存的变更");
+      await loadAll();
+    } catch (e) {
+      toast("保存失败：" + e.message, false);
+    } finally {
+      $("saveBtn").disabled = false;
+    }
+  }
+
+  async function enableWebui() {
+    try {
+      await bridge.apiPost("config", { enable_webui: true });
+      toast("Web UI 管理已启用");
+      await loadAll();
+    } catch (e) {
+      toast("启用失败：" + e.message, false);
+    }
+  }
+
+  async function runTest() {
+    const text = $("testText").value.trim();
+    const style = $("testStyle").value;
+    const btn = $("testBtn");
+    const out = $("testResult");
+    btn.disabled = true;
+    out.textContent = "合成中…（引擎首次加载风格可能需要数十秒）";
+    try {
+      const res = await bridge.apiPost("test", {
+        text: text || "こんにちは、これはテスト音声です。",
+        style: style || null,
+      });
+      out.textContent = `✅ 合成成功\n朗读文本：${res.text}\n风格：${res.style_label}\n文件：${res.file}`;
+    } catch (e) {
+      out.textContent = "❌ " + e.message;
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  $("saveBtn").addEventListener("click", saveConfig);
+  $("reloadBtn").addEventListener("click", loadAll);
+  $("refreshStatusBtn").addEventListener("click", refreshStatus);
+  $("testBtn").addEventListener("click", runTest);
+  $("enableWebuiBtn").addEventListener("click", enableWebui);
+
+  await bridge.ready();
+  await loadAll();
+</script>
+</body>
+</html>

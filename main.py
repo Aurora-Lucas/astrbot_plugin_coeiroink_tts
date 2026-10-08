@@ -30,6 +30,7 @@ from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import Record
 from astrbot.api.provider import ProviderType
 from astrbot.api.star import Context, Star
+from astrbot.api.web import error_response, json_response, request
 from astrbot.core.agent.tool import FunctionTool
 from astrbot.core.provider.provider import TTSProvider
 from astrbot.core.provider.register import register_provider_adapter
@@ -64,6 +65,9 @@ VALID_MODES = ("always_translate", "on_demand", "probabilistic", "japanese_only"
 
 _LLM_TOOL_NAME = "coeiroink_speak"
 
+# 插件标识（与 metadata.yaml 的 name 一致；Web UI 路由以它作为前缀）
+_PLUGIN_NAME = "astrbot_plugin_coeiroink_tts"
+
 # 防止并发重复拉起引擎（模块级锁，进程内唯一）
 _ENGINE_START_LOCK = asyncio.Lock()
 _ENGINE_PROCESS: "subprocess.Popen[bytes] | None" = None
@@ -77,6 +81,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "keep_temp_files": False,
     "auto_start_engine": True,
     "enable_llm_tool": False,
+    "enable_webui": False,
     "engine_start_timeout": 90,
     "min_available_memory_mb": 500,
     "max_text_length": 200,
@@ -886,6 +891,8 @@ class CoeiroinkTTSPlugin(Star):
 
     def __init__(self, context: Context, config: dict | None = None) -> None:
         super().__init__(context, config)
+        # 保留 AstrBotConfig 引用（含 save_config()），供 Web UI 写回配置
+        self._astrbot_config = config if hasattr(config, "save_config") else None
         self.config: dict[str, Any] = dict(DEFAULT_CONFIG)
         if config:
             for k, v in config.items():
@@ -905,6 +912,7 @@ class CoeiroinkTTSPlugin(Star):
         if self._cfg("auto_start_engine"):
             self._warmup_task = asyncio.create_task(self._warm_up_engine())
         self._register_llm_tools_if_needed()
+        self._register_web_apis()
 
     async def terminate(self) -> None:
         if self._warmup_task and not self._warmup_task.done():
@@ -962,6 +970,182 @@ class CoeiroinkTTSPlugin(Star):
         except Exception as e:  # noqa: BLE001
             logger.error(f"[COEIROINK] 注册 LLM 工具失败：{e}")
         self._llm_tools_registered = True
+
+    # ---------------- Web UI（插件 Pages） ----------------
+
+    def _webui_enabled(self) -> bool:
+        return bool(self._cfg("enable_webui"))
+
+    def _register_web_apis(self) -> None:
+        """注册 Web UI 后端接口。
+
+        AstrBot 的 register_web_api 对「相同路由 + 相同方法」幂等（自动替换），
+        因此插件热重载后重复调用是安全的。路由前缀必须是插件标识名。
+        """
+        api = f"/{_PLUGIN_NAME}"
+        try:
+            self.context.register_web_api(
+                f"{api}/config", self._webui_get_config, ["GET"], "读取插件配置"
+            )
+            self.context.register_web_api(
+                f"{api}/config", self._webui_save_config, ["POST"], "保存插件配置"
+            )
+            self.context.register_web_api(
+                f"{api}/status", self._webui_status, ["GET"], "引擎与运行状态"
+            )
+            self.context.register_web_api(
+                f"{api}/test", self._webui_test_synth, ["POST"], "测试合成一句话"
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"[COEIROINK] 注册 Web UI 接口失败：{e}")
+
+    async def _save_config(self) -> bool:
+        """把当前配置写回 AstrBot 配置文件（Web UI 保存时调用）。"""
+        cfg = self._astrbot_config
+        if cfg is None:
+            return False
+        try:
+            # save_config_async 会把给定值合并进配置快照后落盘，不阻塞事件循环
+            await cfg.save_config_async(dict(self.config))
+            return True
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"[COEIROINK] 保存配置失败：{e}")
+            return False
+
+    async def _webui_get_config(self):
+        """GET /config：返回当前配置与风格/模式说明。"""
+        return json_response({
+            "enable_webui": self._webui_enabled(),
+            "config": dict(self.config),
+            "styles": [
+                {"id": sid, "label": style_label(sid), "zh": zh, "ja": ja}
+                for sid, (zh, ja) in STYLE_TABLE.items()
+            ],
+            "modes": [
+                {"value": "always_translate", "label": "总是翻译朗读"},
+                {"value": "on_demand", "label": "按需触发"},
+                {"value": "probabilistic", "label": "概率触发"},
+                {"value": "japanese_only", "label": "仅日语朗读"},
+            ],
+        })
+
+    async def _webui_save_config(self):
+        """POST /config：校验并保存配置项（只接受已知键，按类型收敛）。"""
+        payload = await request.json(default=None)
+        if not isinstance(payload, dict):
+            return error_response("请求体必须是 JSON 对象", status_code=400)
+
+        int_keys = {
+            "engine_start_timeout", "min_available_memory_mb",
+            "max_text_length", "output_sampling_rate",
+        }
+        float_keys = {"probability", "speedScale"}
+        bool_keys = {
+            "enabled", "enable_mp3", "keep_temp_files",
+            "auto_start_engine", "enable_llm_tool", "skip_if_too_long",
+            "enable_webui",
+        }
+        str_keys = {
+            "mode", "style_id", "api_base", "speaker_uuid",
+            "engine_dir", "engine_bin", "engine_log", "ffmpeg_path",
+            "translate_system_prompt",
+        }
+
+        updated: dict[str, Any] = {}
+        for key, raw in payload.items():
+            if key not in DEFAULT_CONFIG:
+                continue
+            try:
+                if key in bool_keys:
+                    if isinstance(raw, bool):
+                        value: Any = raw
+                    elif str(raw).strip().lower() in ("true", "false"):
+                        value = str(raw).strip().lower() == "true"
+                    else:
+                        return error_response(f"配置项 {key} 必须是布尔值", status_code=400)
+                elif key in int_keys:
+                    value = int(float(raw))
+                elif key in float_keys:
+                    value = float(raw)
+                else:
+                    value = str(raw).strip()
+            except (TypeError, ValueError):
+                return error_response(f"配置项 {key} 的值非法", status_code=400)
+
+            if key == "mode" and value not in VALID_MODES:
+                return error_response(
+                    f"触发模式必须是以下之一：{'、'.join(VALID_MODES)}", status_code=400
+                )
+            if key == "style_id" and normalize_style(value) is None:
+                return error_response(
+                    f"无法识别的风格「{value}」。可用风格：{describe_styles()}", status_code=400
+                )
+            updated[key] = value
+
+        if not updated:
+            return json_response({"saved": False, "changed": [], "config": dict(self.config)})
+
+        self.config.update(updated)
+        if not await self._save_config():
+            return error_response("配置已更新到内存，但写回配置文件失败", status_code=500)
+        return json_response({
+            "saved": True,
+            "changed": list(updated.keys()),
+            "config": dict(self.config),
+        })
+
+    async def _webui_status(self):
+        """GET /status：引擎探活、内存、风格等运行状态。"""
+        api_base = str(self._cfg("api_base") or "")
+        alive = await check_engine_alive(api_base)
+        style_id, _ = self._resolve_style(None)
+        engine_pid = None
+        if _ENGINE_PROCESS is not None and _ENGINE_PROCESS.poll() is None:
+            engine_pid = _ENGINE_PROCESS.pid
+        engine_dir = resolve_engine_dir(self._cfg("engine_dir"))
+        return json_response({
+            "plugin_enabled": bool(self._cfg("enabled")),
+            "webui_enabled": self._webui_enabled(),
+            "mode": self._cfg("mode"),
+            "style_id": style_id,
+            "style_label": style_label(style_id),
+            "engine_alive": alive,
+            "engine_pid": engine_pid,
+            "api_base": api_base,
+            "engine_dir": engine_dir or None,
+            "engine_bin": resolve_engine_bin(engine_dir, self._cfg("engine_bin") or None),
+            "engine_log": resolve_engine_log(engine_dir, self._cfg("engine_log")),
+            "ffmpeg": resolve_ffmpeg(self._cfg("ffmpeg_path")) or None,
+            "mem_available_mb": available_memory_mb(),
+            "min_available_memory_mb": float(self._cfg("min_available_memory_mb") or 0),
+        })
+
+    async def _webui_test_synth(self):
+        """POST /test：用当前配置合成一句测试语音。"""
+        if not self._webui_enabled():
+            return error_response("Web UI 管理未启用，无法执行测试合成", status_code=403)
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            payload = {}
+        text = str(payload.get("text") or "こんにちは、これはテスト音声です。").strip()
+        if not text:
+            return error_response("测试文本为空", status_code=400)
+        style_id, style_err = self._resolve_style(payload.get("style"))
+        if style_err:
+            return error_response(style_err, status_code=400)
+        jp = text if is_japanese(text) else await self._to_japanese(text, None)
+        if not jp:
+            return error_response("翻译失败：未找到可用的对话模型", status_code=502)
+        path = await self._synthesize(jp, style_id)
+        if not path:
+            return error_response("语音合成失败：引擎不可用或文本为空", status_code=502)
+        return json_response({
+            "ok": True,
+            "text": jp,
+            "style_id": style_id,
+            "style_label": style_label(style_id),
+            "file": path,
+        })
 
     # ---------------- 引擎 / 合成封装 ----------------
 
