@@ -7,7 +7,9 @@
 > v1.3.0 起内置 Web UI 图形化管理面板（可开关，开启后原配置面板仅保留开关）；
 > v1.3.1 起在 README 与插件描述中加入本地 TTS 宣传介绍；
 > v1.4.0 起新增 Web UI 安装向导页（环境自检/下载指引/目录校验/后台启动/合成验证）；
-> v1.4.1 起安装向导磁盘自检按文件系统去重，避免同一磁盘重复显示）。
+> v1.4.1 起安装向导磁盘自检按文件系统去重，避免同一磁盘重复显示；
+> v1.5.0 起因 AstrBot 页面 iframe 沙箱不支持跨页跳转，管理面板与安装向导合并为单页双标签，
+> 启动引擎就绪后自动切回管理面板标签；并通过 `.astrbot-plugin/i18n` 提供中文页面标题）。
 > 无法从代码/环境中确认的点，统一用「**待确认**」标注，不做臆测。
 
 > ### 🔊 音源与软件致谢
@@ -32,8 +34,9 @@
 ├── _conf_schema.json      # AstrBot 插件配置面板 schema（22 个配置项；除 enabled/enable_webui 外均 invisible，由 Web UI 管理）
 ├── _selftest_synth.py     # 独立自测脚本：绕开 AstrBot 直接调用核心合成函数
 ├── pages/                 # 内置 Web UI（AstrBot 插件 Pages）
-│   ├── settings/          # 管理面板 Page（index.html + assets/logo.png）
-│   └── install/           # 安装向导 Page（index.html + assets/logo.png，五步部署流程）
+│   └── settings/          # 双标签页面（管理面板 + 安装向导）：index.html + assets/logo.png
+├── .astrbot-plugin/       # 插件国际化（页面标题）
+│   └── i18n/              # zh-CN.json / en-US.json：pages.settings.title=管理面板/Dashboard
 └── __pycache__/           # Python 字节码缓存（main.cpython-312.pyc），运行期自动生成
 ```
 
@@ -148,7 +151,7 @@
 3. **LLM 工具** `coeiroink_speak` → `_llm_tool_handler(event, text, style=None)`
    - 参数：`text`（必填）、`style`（可选，本次朗读临时风格）
    - （已是日语则跳过翻译）翻译 → 合成 → `event.send(MessageChain([Record(...)]))`，返回「已发送语音。」
-4. **Web UI Pages**：`pages/settings/index.html`（管理面板）与 `pages/install/index.html`（安装向导），均为单文件自包含页面，通过 `window.AstrBotPluginPage` bridge 与后端通信，支持暗色主题；后端为上面 2.7 的 Web API 路由
+4. **Web UI Pages**：`pages/settings/index.html`（单文件自包含，双标签：管理面板 + 安装向导，通过 `window.AstrBotPluginPage` bridge 与后端通信，支持暗色主题）；**因 AstrBot 页面 iframe 沙箱（无 allow-top-navigation）与 bridge 均不支持跨页跳转，两个功能合并为单页标签切换**；启动引擎就绪后自动切回管理面板标签；页面标题经 `.astrbot-plugin/i18n/*.json` 的 `pages.settings.title` 本地化（zh-CN：管理面板）
 
 ---
 
@@ -278,7 +281,7 @@
 4. **TTS Provider 适配器**：`register_provider_adapter(provider_type_name="coeiroink_tts", provider_type=ProviderType.TEXT_TO_SPEECH, ...)(CoeiroinkTTSProvider)`，供 AstrBot 统一 TTS 链路调用。
    - **注意**：当前 `cmd_config.json` 的 `provider_tts_settings.enable=false`、`provider_id=""`，即 AstrBot 全局 TTS 开关是关闭的；插件目前实际靠 `on_decorating_result` 钩子与命令/工具发语音。Provider 适配器已注册可被选用，但未在 provider 列表实例化。
 5. **渠道支持**：本插件可以联动 **NapCat** 使用 QQ 语音；其他渠道暂未测试。如在其他渠道测试过，请提供测试环境及日志，提交报告到 GitHub：https://github.com/Aurora-Lucas/astrbot_plugin_coeiroink_tts/issues
-6. **Web UI（插件 Pages）**：`pages/settings/index.html`（管理面板）与 `pages/install/index.html`（安装向导）由 Dashboard 以受限 iframe 加载，页面脚本经 `window.AstrBotPluginPage` bridge 调用后端；bridge 端点（不含插件名）由 Dashboard 转发到 `/api/v1/plugins/extensions/<plugin_name>/…`，再匹配 `context.register_web_api` 注册的路由（见 2.7）。启用开关为配置项 `enable_webui`。
+6. **Web UI（插件 Pages）**：`pages/settings/index.html`（双标签：管理面板 + 安装向导）由 Dashboard 以受限 iframe 加载（`sandbox="allow-scripts allow-forms allow-downloads"`，无跨页导航能力，故采用单页标签），页面脚本经 `window.AstrBotPluginPage` bridge 调用后端；bridge 端点（不含插件名）由 Dashboard 转发到 `/api/v1/plugins/extensions/<plugin_name>/…`，再匹配 `context.register_web_api` 注册的路由（见 2.7）。启用开关为配置项 `enable_webui`；页面标题由 `.astrbot-plugin/i18n` 提供。
 
 ---
 

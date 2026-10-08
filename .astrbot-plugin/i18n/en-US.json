@@ -1,0 +1,8 @@
+{
+  "pages": {
+    "settings": {
+      "title": "Dashboard",
+      "description": "Graphical settings, runtime status, synthesis test and engine installation wizard."
+    }
+  }
+}
