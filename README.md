@@ -209,7 +209,7 @@ Web UI 后端接口（`context.register_web_api`，路由前缀为插件标识�
 
 本插件代码以 **[CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/deed.zh-hans)**
 （知识共享 署名-非商业性使用 4.0 国际）许可协议发布，全文见 [LICENSE](./LICENSE)。
-使用时请保留作者署名（索拉），且**不得用于商业目的**。
+使用时请保留作者署名（Aurora & deepseek），且**不得用于商业目的**。
 
 插件引用的第三方资源按其原有条款使用：
 音源「月读酱」（Tsukuyomi-chan）© 夢前黎、软件 COEIROINK © シロワニさん、
