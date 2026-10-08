@@ -111,15 +111,14 @@ _POOL_MAX_CANDIDATES = 30  # 单次交给 LLM 复审的候选上限（控制 pro
 _USAGE_MAX_TRACKED = 512  # 命中统计最多保留多少条（按最近使用淘汰）
 
 _POOL_REVIEW_PROMPT = (
-    "你是语音合成插件的缓存治理助手。用户会给出语音片段的统计信息（JSON）："
-    "candidates 是近期复用较多的片段（含 id、文本、命中次数、字符数、是否长文），"
-    "pool 是当前长期保留池中的片段。\n"
-    "请判断哪些 candidates 值得放入长期保留池：优先保留通用问候/寒暄、口头禅、"
-    "模板化固定回复、命中次数高且文本较短的片段；可以丢弃一次性长文或高度具体、"
-    "几乎不会复现的内容。\n"
-    "若 pool 条目过多，可给出建议淘汰的 id。\n"
+    "你是语音合成插件的缓存治理助手。用户会给出语音片段统计（JSON）："
+    "candidates（含 id、文本、命中次数 hits、字符数 chars、调用次数排名 rank、"
+    "算法建议 suggested：ultra=超长期保留 / pool=长期保留 / skip=不建议保留），"
+    "以及 pool（当前已保留的片段，含 tier）。\n"
+    "系统已用「调用次数排序」按规则给出了 suggested 建议（排名靠前或调用次数高 → ultra）。"
+    "请在算法结果的基础上复核：可把确实通用的片段提升为 ultra，把一次性长文降级或剔除。\n"
     "只输出 JSON，不要解释、不要代码块，格式："
-    '{"keep": [id...], "evict": [id...], "reason": "一句话理由"}'
+    '{"ultra": [id...], "keep": [id...], "evict": [id...], "reason": "一句话理由"}'
 )
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -151,6 +150,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "phrase_pool_retention_days": 30,
     "phrase_pool_llm_review": True,
     "phrase_pool_review_hours": 24,
+    # 排序权重与「超长期池」晋级条件（两者为「或」关系）
+    "phrase_rank_mode": "hits",  # hits=纯调用次数（基础权重）；weighted=次数×文本长度
+    "phrase_ultra_top_rank": 8,  # 调用次数排名进入前 X 名 → 超长期池（0=关闭该条件）
+    "phrase_ultra_min_hits": 10,  # 调用次数 ≥ X → 超长期池（0=关闭该条件）
+    "phrase_ultra_max_entries": 32,  # 超长期池容量上限
+    "phrase_ultra_retention_days": 365,  # 超长期池保留天数（0=永久）
     "allow_style_override": True,
     "style_switch_min_free_mb": 800,
     "allow_remote_engine": False,
@@ -226,6 +231,7 @@ def parse_pool_review_response(raw: str) -> dict[str, Any] | None:
 
     return {
         "keep": _ids(data.get("keep")),
+        "ultra": _ids(data.get("ultra")),
         "evict": _ids(data.get("evict")),
         "reason": str(data.get("reason") or ""),
     }
@@ -1440,6 +1446,10 @@ class CoeiroinkTTSPlugin(Star):
             "phrase_pool_max_entries",
             "phrase_pool_retention_days",
             "phrase_pool_review_hours",
+            "phrase_ultra_top_rank",
+            "phrase_ultra_min_hits",
+            "phrase_ultra_max_entries",
+            "phrase_ultra_retention_days",
         }
         float_keys = {"probability", "speedScale"}
         bool_keys = {
@@ -1512,6 +1522,16 @@ class CoeiroinkTTSPlugin(Star):
                 )
             if key == "phrase_pool_review_hours" and value < 1:
                 return error_response("phrase_pool_review_hours 必须 ≥ 1", status_code=400)
+            if key == "phrase_rank_mode" and value not in ("hits", "weighted"):
+                return error_response("phrase_rank_mode 必须是 hits 或 weighted", status_code=400)
+            if key in ("phrase_ultra_top_rank", "phrase_ultra_min_hits") and value < 0:
+                return error_response(f"{key} 必须 ≥ 0（0=关闭该条件）", status_code=400)
+            if key == "phrase_ultra_max_entries" and value < 1:
+                return error_response("phrase_ultra_max_entries 必须 ≥ 1", status_code=400)
+            if key == "phrase_ultra_retention_days" and value < 0:
+                return error_response(
+                    "phrase_ultra_retention_days 必须 ≥ 0（0=永久）", status_code=400
+                )
             if key == "phrase_split_mode" and value not in ("sentence", "clause"):
                 return error_response(
                     "phrase_split_mode 必须是 sentence 或 clause", status_code=400
@@ -1557,6 +1577,9 @@ class CoeiroinkTTSPlugin(Star):
                 "synth_inflight": _SYNTH_INFLIGHT,
                 "pool_enabled": self._pool_enabled(),
                 "pool_entries": len(self._pool),
+                "pool_ultra_entries": sum(
+                    1 for v in self._pool.values() if str(v.get("tier") or "pool") == "ultra"
+                ),
                 "pool_dir": str(resolve_pool_dir() or "") or None,
                 "usage_tracked": len(self._usage),
                 "engine_dir": engine_dir or None,
@@ -2112,9 +2135,57 @@ class CoeiroinkTTSPlugin(Star):
             logger.info(f"[COEIROINK] 长期保留池已载入 {loaded} 条（{pool_dir}）")
         return loaded
 
+    def _entry_weight(self, info: dict[str, Any]) -> float:
+        """条目权重（排序基础）：默认纯调用次数；weighted 模式按「次数 × 文本长度」近似节省的合成量。"""
+        hits = float(int(info.get("hits", 0)))
+        if str(self._cfg("phrase_rank_mode") or "hits") == "weighted":
+            return hits * max(1, len(str(info.get("text") or "")))
+        return hits
+
+    def _rank_entries(self) -> list[tuple[tuple[Any, ...], dict[str, Any], int]]:
+        """把「命中统计 + 池内条目」合并后按权重降序排名（1-based）。
+
+        权重相同按最近使用时间排序，保证排名稳定。
+        """
+        merged: dict[tuple[Any, ...], dict[str, Any]] = {}
+        for key, info in self._usage.items():
+            merged[key] = {
+                "hits": int(info.get("hits", 0)),
+                "ts": float(info.get("ts", 0) or 0),
+                "text": str(info.get("text") or key[0]),
+                "path": str(info.get("path") or ""),
+                "in_pool": key in self._pool,
+            }
+        for key, entry in self._pool.items():
+            prev = merged.get(key)
+            merged[key] = {
+                "hits": max(int(entry.get("hits", 0)), int(prev["hits"]) if prev else 0),
+                "ts": max(
+                    float(entry.get("last_used", 0) or 0), float(prev["ts"]) if prev else 0.0
+                ),
+                "text": str(entry.get("text") or (prev["text"] if prev else key[0])),
+                "path": str(entry.get("path") or (prev["path"] if prev else "")),
+                "in_pool": True,
+                "tier": str(entry.get("tier") or "pool"),
+            }
+        ordered = sorted(
+            merged.items(),
+            key=lambda kv: (-self._entry_weight(kv[1]), -float(kv[1].get("ts") or 0)),
+        )
+        return [(key, info, idx + 1) for idx, (key, info) in enumerate(ordered)]
+
+    def _ultra_qualified(self, info: dict[str, Any], rank: int) -> bool:
+        """是否满足「超长期池」条件：排名前 X **或** 调用次数 ≥ Y（两个条件为或关系）。"""
+        top = int(self._cfg("phrase_ultra_top_rank") or 0)
+        min_hits = int(self._cfg("phrase_ultra_min_hits") or 0)
+        by_rank = top > 0 and rank <= top
+        by_hits = min_hits > 0 and int(info.get("hits", 0)) >= min_hits
+        return by_rank or by_hits
+
     def _pool_candidates(self) -> list[dict[str, Any]]:
         """按复频率筛出可晋升候选：命中数达标、文件仍在、尚未在池内。"""
         min_hits = max(1, int(self._cfg("phrase_pool_min_hits") or 3))
+        ranks = {key: rank for key, _, rank in self._rank_entries()}
         items: list[dict[str, Any]] = []
         for key, info in self._usage.items():
             if key in self._pool:
@@ -2125,19 +2196,26 @@ class CoeiroinkTTSPlugin(Star):
             path = str(info.get("path") or "")
             if not path or not os.path.isfile(path):
                 continue
+            rank = int(ranks.get(key, 0))
             items.append(
                 {
                     "key": key,
                     "text": str(info.get("text") or key[0]),
                     "hits": hits,
                     "path": path,
+                    "rank": rank,
+                    "suggested": "ultra" if self._ultra_qualified(info, rank) else "pool",
                 }
             )
-        items.sort(key=lambda x: (-x["hits"], len(x["text"])))
+        # 权重降序（与排名算法一致），而不是单纯按命中数
+        items.sort(key=lambda x: (-self._entry_weight(x), x.get("rank") or 10**9))
         return items[:_POOL_MAX_CANDIDATES]
 
-    def _pool_promote(self, candidate: dict[str, Any]) -> bool:
-        """把候选音频复制进长期池（不动原文件，池内副本为权威）。"""
+    def _pool_promote(self, candidate: dict[str, Any], tier: str = "pool") -> bool:
+        """把候选音频复制进保留池（不动原文件，池内副本为权威）。
+
+        `tier="ultra"` 表示超长期池（更长保留期，容量单独限制）。
+        """
         pool_dir = resolve_pool_dir()
         if pool_dir is None:
             return False
@@ -2157,10 +2235,19 @@ class CoeiroinkTTSPlugin(Star):
             "hits": int(candidate["hits"]),
             "last_used": now,
             "promoted_at": now,
+            "tier": "ultra" if tier == "ultra" else "pool",
         }
         # 池内已有权威副本，临时缓存条目可移除，避免引用被清理的文件
         self._synth_cache.pop(key, None)
         self._phrase_cache.pop(key, None)
+        return True
+
+    def _pool_retier(self, key: tuple[Any, ...], tier: str) -> bool:
+        """把已在池内的条目升级/降级 tier（不重新复制文件）。"""
+        entry = self._pool.get(key)
+        if not entry or str(entry.get("tier") or "pool") == tier:
+            return False
+        entry["tier"] = tier
         return True
 
     def _pool_drop(self, key: tuple[Any, ...]) -> None:
@@ -2169,28 +2256,50 @@ class CoeiroinkTTSPlugin(Star):
             _safe_unlink(str(entry.get("path") or ""))
 
     def _pool_enforce_limits(self) -> int:
-        """超出 `phrase_pool_max_entries` 时，按命中数/最近使用淘汰。"""
-        max_entries = max(1, int(self._cfg("phrase_pool_max_entries") or 64))
+        """按 tier 限额淘汰：超长期池用 `phrase_ultra_max_entries`，长期池用 `phrase_pool_max_entries`。
+
+        淘汰顺序按「权重最低、最久未用」优先。
+        """
         removed = 0
-        while len(self._pool) > max_entries:
-            key = min(
-                self._pool,
-                key=lambda k: (
-                    int(self._pool[k].get("hits", 0)),
-                    float(self._pool[k].get("last_used", 0)),
-                ),
-            )
-            self._pool_drop(key)
-            removed += 1
+        for tier, cfg_key, default in (
+            ("ultra", "phrase_ultra_max_entries", 32),
+            ("pool", "phrase_pool_max_entries", 64),
+        ):
+            limit = max(1, int(self._cfg(cfg_key) or default))
+            keys = [k for k, v in self._pool.items() if str(v.get("tier") or "pool") == tier]
+            while len(keys) > limit:
+                victim = min(
+                    keys,
+                    key=lambda k: (
+                        self._entry_weight(self._pool[k]),
+                        float(self._pool[k].get("last_used", 0)),
+                    ),
+                )
+                keys.remove(victim)
+                self._pool_drop(victim)
+                removed += 1
         return removed
 
     def _pool_expire(self) -> int:
-        """删除超过 `phrase_pool_retention_days` 未使用的池条目（0=永久保留）。"""
-        days = int(self._cfg("phrase_pool_retention_days") or 0)
-        if days <= 0 or not self._pool:
+        """按 tier 保留期回收：超长期池用 `phrase_ultra_retention_days`（0=永久）。"""
+        if not self._pool:
             return 0
-        cutoff = time.time() - days * 86400
-        expired = [k for k, v in self._pool.items() if float(v.get("last_used") or 0) < cutoff]
+        now = time.time()
+        expired: list[tuple[Any, ...]] = []
+        for key, entry in self._pool.items():
+            tier = str(entry.get("tier") or "pool")
+            days = int(
+                self._cfg(
+                    "phrase_ultra_retention_days"
+                    if tier == "ultra"
+                    else "phrase_pool_retention_days"
+                )
+                or 0
+            )
+            if days <= 0:  # 永久保留
+                continue
+            if float(entry.get("last_used") or 0) < now - days * 86400:
+                expired.append(key)
         for key in expired:
             self._pool_drop(key)
         if expired:
@@ -2203,21 +2312,28 @@ class CoeiroinkTTSPlugin(Star):
         candidates: list[dict[str, Any]],
         pool_entries: list[tuple[tuple[Any, ...], dict[str, Any]]],
     ) -> dict[str, Any] | None:
-        """请当前对话模型复审候选与池内条目；无可用模型或调用失败返回 None。"""
+        """请当前对话模型在「排序算法结果」之上复核；无可用模型或调用失败返回 None。"""
         try:
             provider = await self.context.get_using_provider_async(None)
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"[COEIROINK] 长期池复审获取对话模型失败：{e}")
+            logger.warning(f"[COEIROINK] 保留池复审获取对话模型失败：{e}")
             return None
         if provider is None:
             return None
         payload = {
+            "rank_mode": str(self._cfg("phrase_rank_mode") or "hits"),
+            "ultra_rule": {
+                "top_rank": int(self._cfg("phrase_ultra_top_rank") or 0),
+                "min_hits": int(self._cfg("phrase_ultra_min_hits") or 0),
+            },
             "candidates": [
                 {
                     "id": idx,
                     "text": c["text"][:80],
                     "hits": c["hits"],
                     "chars": len(c["text"]),
+                    "rank": int(c.get("rank") or 0),
+                    "suggested": str(c.get("suggested") or "pool"),
                 }
                 for idx, c in enumerate(candidates)
             ],
@@ -2226,10 +2342,12 @@ class CoeiroinkTTSPlugin(Star):
                     "id": idx,
                     "text": str(info.get("text") or "")[:80],
                     "hits": int(info.get("hits", 0)),
+                    "tier": str(info.get("tier") or "pool"),
                 }
                 for idx, (_, info) in enumerate(pool_entries)
             ],
             "pool_limit": max(1, int(self._cfg("phrase_pool_max_entries") or 64)),
+            "ultra_limit": max(1, int(self._cfg("phrase_ultra_max_entries") or 32)),
         }
         try:
             resp = await provider.text_chat(
@@ -2237,62 +2355,122 @@ class CoeiroinkTTSPlugin(Star):
                 system_prompt=_POOL_REVIEW_PROMPT,
             )
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"[COEIROINK] 长期池复审调用失败：{e}")
+            logger.warning(f"[COEIROINK] 保留池复审调用失败：{e}")
             return None
         return parse_pool_review_response(str(getattr(resp, "completion_text", "") or ""))
 
     async def _pool_review_once(self, *, force_llm: bool = False) -> dict[str, Any]:
-        """执行一次长期池复审：规则筛候选 →（可选）LLM 决策 → 晋升/淘汰 → 落盘。"""
+        """执行一次保留池复审：**排序算法给权重与建议 → LLM 决策 → 限额淘汰 → 落盘**。
+
+        - 排序算法（`phrase_rank_mode`，默认纯调用次数）为每个候选算出排名与建议层级：
+          「排名前 X」**或**「调用次数 ≥ Y」→ 建议 ultra（超长期池），其余达门槛 → 建议 pool；
+        - LLM 可用时：以算法建议为参考做最终决策（`ultra` 提升层级、`keep` 纳入长期池、
+          `evict` 淘汰），未列入的候选不晋升；
+        - **LLM 不可用/失败时：直接采用算法结果**（建议 ultra 的进超长期池、建议 pool 的进长期池，
+          池内达到超长期条件的条目就地升级）；
+        - 最后按 tier 限额与保留期回收并落盘。
+        """
         result: dict[str, Any] = {
             "enabled": self._pool_enabled(),
             "llm_used": False,
+            "rank_mode": str(self._cfg("phrase_rank_mode") or "hits"),
             "candidates": 0,
+            "rule_promoted": 0,
+            "rule_ultra": 0,
             "promoted": 0,
+            "promoted_ultra": 0,
+            "upgraded_ultra": 0,
             "evicted": 0,
             "reason": "",
             "pool_entries": len(self._pool),
+            "ultra_entries": 0,
         }
         if not result["enabled"]:
             return result
+
+        ranks = {key: rank for key, _, rank in self._rank_entries()}
         candidates = self._pool_candidates()
         result["candidates"] = len(candidates)
         pool_entries = list(self._pool.items())
 
-        keep_ids: list[int] | None = None
-        evict_ids: list[int] = []
+        promoted = 0
+        promoted_ultra = 0
+        upgraded_ultra = 0
+        evicted = 0
+
         use_llm = bool(self._cfg("phrase_pool_llm_review")) or force_llm
+        decision = None
         if use_llm and (candidates or pool_entries):
             decision = await self._llm_review_pool(candidates, pool_entries)
-            if decision is not None:
-                result["llm_used"] = True
-                result["reason"] = str(decision.get("reason") or "")
-                keep_ids = list(decision.get("keep") or [])
-                evict_ids = list(decision.get("evict") or [])
-                logger.info(
-                    f"[COEIROINK] LLM 复审结果：keep={keep_ids} evict={evict_ids}"
-                    f"（{result['reason'][:60]}）"
-                )
-        if keep_ids is None:
-            # 无 LLM 或调用失败：按规则全部晋升
-            keep_ids = list(range(len(candidates)))
 
-        promoted = 0
-        for idx in keep_ids:
-            if 0 <= idx < len(candidates) and self._pool_promote(candidates[idx]):
-                promoted += 1
-        evicted = 0
-        for idx in evict_ids:
-            if 0 <= idx < len(pool_entries):
-                self._pool_drop(pool_entries[idx][0])
-                evicted += 1
+        if decision is not None:
+            # ---- LLM 决策（参考算法建议）----
+            result["llm_used"] = True
+            result["reason"] = str(decision.get("reason") or "")
+            ultra_ids = list(decision.get("ultra") or [])
+            keep_ids = list(decision.get("keep") or [])
+            evict_ids = list(decision.get("evict") or [])
+            logger.info(
+                f"[COEIROINK] LLM 复审结果：ultra={ultra_ids} keep={keep_ids} "
+                f"evict={evict_ids}（{result['reason'][:60]}）"
+            )
+            for idx in ultra_ids:
+                if not 0 <= idx < len(candidates):
+                    continue
+                cand = candidates[idx]
+                if cand["key"] in self._pool:
+                    if self._pool_retier(cand["key"], "ultra"):
+                        upgraded_ultra += 1
+                        promoted_ultra += 1
+                elif self._pool_promote(cand, "ultra"):
+                    promoted += 1
+                    promoted_ultra += 1
+            for idx in keep_ids:
+                if not 0 <= idx < len(candidates):
+                    continue
+                cand = candidates[idx]
+                if cand["key"] not in self._pool and self._pool_promote(cand, "pool"):
+                    promoted += 1
+            for idx in evict_ids:
+                if 0 <= idx < len(pool_entries):
+                    self._pool_drop(pool_entries[idx][0])
+                    evicted += 1
+        else:
+            # ---- 纯排序算法决策（LLM 不可用/失败/已关闭）----
+            result["reason"] = "仅使用排序算法结果（LLM 不可用或已关闭）"
+            for cand in candidates:
+                tier = "ultra" if cand.get("suggested") == "ultra" else "pool"
+                if self._pool_promote(cand, tier):
+                    promoted += 1
+                    if tier == "ultra":
+                        promoted_ultra += 1
+            for key, entry in list(self._pool.items()):
+                if str(entry.get("tier") or "pool") == "ultra":
+                    continue
+                rank = int(ranks.get(key, 0) or 0)
+                info = {"hits": int(entry.get("hits", 0)), "text": str(entry.get("text") or "")}
+                if rank and self._ultra_qualified(info, rank) and self._pool_retier(key, "ultra"):
+                    upgraded_ultra += 1
+
+        result["rule_promoted"] = 0 if result["llm_used"] else promoted
+        result["rule_ultra"] = 0 if result["llm_used"] else promoted_ultra + upgraded_ultra
+
         evicted += self._pool_enforce_limits()
         result["promoted"] = promoted
+        result["promoted_ultra"] = promoted_ultra
+        result["upgraded_ultra"] = upgraded_ultra
         result["evicted"] = evicted
         result["pool_entries"] = len(self._pool)
-        if promoted or evicted:
+        result["ultra_entries"] = sum(
+            1 for v in self._pool.values() if str(v.get("tier") or "pool") == "ultra"
+        )
+        if promoted or evicted or upgraded_ultra:
             self._pool_save_index()
             logger.info(
-                f"[COEIROINK] 长期池复审完成：晋升 {promoted}、淘汰 {evicted}，当前 {len(self._pool)} 条"
+                f"[COEIROINK] 保留池复审完成（{result['rank_mode']}，"
+                f"{'LLM' if result['llm_used'] else '规则'}）：晋升 {promoted}"
+                f"（超长期 {promoted_ultra}）、层级升级 {upgraded_ultra}、淘汰 {evicted}，"
+                f"当前 {len(self._pool)} 条（超长期 {result['ultra_entries']}）"
             )
         return result
 

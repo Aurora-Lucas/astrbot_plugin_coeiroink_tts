@@ -296,5 +296,48 @@
         "type": "int",
         "default": 24,
         "invisible": true
+    },
+    "phrase_rank_mode": {
+        "description": "排序权重算法",
+        "hint": "hits=纯调用次数（基础权重，默认）；weighted=调用次数 × 文本长度（更偏向「省下推理时间多」的长句）。排序结果决定谁进入长期池/超长期池。",
+        "type": "string",
+        "options": [
+            "hits",
+            "weighted"
+        ],
+        "labels": [
+            "纯调用次数（推荐）",
+            "次数×文本长度"
+        ],
+        "default": "hits",
+        "invisible": true
+    },
+    "phrase_ultra_top_rank": {
+        "description": "超长期池条件①：排名前 X",
+        "hint": "调用次数排名进入前 X 名即进入超长期池。与条件②为「或」关系；0 表示关闭该条件。默认 8。",
+        "type": "int",
+        "default": 8,
+        "invisible": true
+    },
+    "phrase_ultra_min_hits": {
+        "description": "超长期池条件②：调用次数 ≥ Y",
+        "hint": "累计调用次数达到 Y 次即进入超长期池。与条件①为「或」关系；0 表示关闭该条件。默认 10。",
+        "type": "int",
+        "default": 10,
+        "invisible": true
+    },
+    "phrase_ultra_max_entries": {
+        "description": "超长期池容量上限",
+        "hint": "超长期池最多保留条数，超出按权重最低淘汰。默认 32。",
+        "type": "int",
+        "default": 32,
+        "invisible": true
+    },
+    "phrase_ultra_retention_days": {
+        "description": "超长期池保留天数",
+        "hint": "超长期池条目多少天未使用即回收；0 表示永久保留。默认 365。",
+        "type": "int",
+        "default": 365,
+        "invisible": true
     }
 }

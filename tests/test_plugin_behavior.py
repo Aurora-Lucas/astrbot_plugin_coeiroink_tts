@@ -410,6 +410,11 @@ def _pool_plugin(tmp_path, monkeypatch, **overrides):
         phrase_pool_max_entries=4,
         phrase_pool_retention_days=30,
         phrase_pool_llm_review=False,
+        phrase_rank_mode="hits",
+        phrase_ultra_top_rank=8,
+        phrase_ultra_min_hits=10,
+        phrase_ultra_max_entries=32,
+        phrase_ultra_retention_days=365,
     )
     cfg.update(overrides)
     plugin = _make_plugin(**cfg)
@@ -433,9 +438,12 @@ def test_key_json_roundtrip():
 def test_parse_pool_review_response_variants():
     assert m.parse_pool_review_response('{"keep": [0, 1], "evict": [2], "reason": "ok"}') == {
         "keep": [0, 1],
+        "ultra": [],
         "evict": [2],
         "reason": "ok",
     }
+    parsed_ultra = m.parse_pool_review_response('{"ultra": [3], "keep": [], "reason": "r"}')
+    assert parsed_ultra and parsed_ultra["ultra"] == [3]
     fenced = m.parse_pool_review_response('```json\n{"keep": [1], "reason": "x"}\n```')
     assert fenced and fenced["keep"] == [1] and fenced["evict"] == []
     noisy = m.parse_pool_review_response('结果为：{"keep": ["2"], "evict": []} 完毕')
@@ -602,3 +610,198 @@ def test_pool_index_roundtrip(tmp_path, monkeypatch):
     other, _ = _pool_plugin(tmp_path, monkeypatch)
     assert other._pool_load_index() == 1
     assert other._pool[key]["hits"] == 7 and other._pool[key]["path"] == str(audio)
+
+
+# ---------------------------------------------------------------------------
+# 排序权重 + 超长期池（1.11.0）
+# ---------------------------------------------------------------------------
+
+
+def test_entry_weight_modes(tmp_path, monkeypatch):
+    plugin, _ = _pool_plugin(tmp_path, monkeypatch)
+    info = {"hits": 4, "text": "こんにちは"}  # 6 字
+    assert plugin._entry_weight(info) == 4.0  # hits 模式：纯调用次数
+    plugin.config["phrase_rank_mode"] = "weighted"
+    assert plugin._entry_weight(info) == 4.0 * len(info["text"])  # weighted：次数 × 长度
+
+
+def test_rank_entries_orders_by_weight_then_recency(tmp_path, monkeypatch):
+    plugin, _ = _pool_plugin(tmp_path, monkeypatch)
+    audio = tmp_path / "a.mp3"
+    audio.write_bytes(b"x")
+    _seed_usage(plugin, "少", 1, audio)
+    _seed_usage(plugin, "多", 9, audio)
+    _seed_usage(plugin, "中", 5, audio)
+    ranked = plugin._rank_entries()
+    assert [info["text"] for _, info, _ in ranked] == ["多", "中", "少"]
+    assert [rank for _, _, rank in ranked] == [1, 2, 3]
+
+
+def test_ultra_qualified_or_logic(tmp_path, monkeypatch):
+    plugin, _ = _pool_plugin(
+        tmp_path, monkeypatch, phrase_ultra_top_rank=3, phrase_ultra_min_hits=10
+    )
+    # 条件①：排名前 3（即使命中次数低）
+    assert plugin._ultra_qualified({"hits": 1, "text": "x"}, 2) is True
+    # 条件②：命中次数 ≥ 10（即使排名靠后）
+    assert plugin._ultra_qualified({"hits": 10, "text": "x"}, 99) is True
+    # 两个条件都不满足
+    assert plugin._ultra_qualified({"hits": 2, "text": "x"}, 50) is False
+
+
+def test_ultra_qualified_respects_disabled_conditions(tmp_path, monkeypatch):
+    plugin, _ = _pool_plugin(
+        tmp_path, monkeypatch, phrase_ultra_top_rank=0, phrase_ultra_min_hits=0
+    )
+    assert plugin._ultra_qualified({"hits": 100, "text": "x"}, 1) is False  # 都关闭 => 不晋级
+
+
+def test_review_promotes_ultra_by_rank_rule(tmp_path, monkeypatch):
+    """LLM 关闭时：排名前 X 的候选直接进超长期池（纯排序算法决策）。"""
+    plugin, _ = _pool_plugin(
+        tmp_path,
+        monkeypatch,
+        phrase_pool_llm_review=False,
+        phrase_ultra_top_rank=1,
+        phrase_ultra_min_hits=0,
+        phrase_pool_min_hits=1,
+    )
+    audio = tmp_path / "a.mp3"
+    audio.write_bytes(b"x")
+    _seed_usage(plugin, "一番よく使う", 5, audio)
+    _seed_usage(plugin, "たまに使う", 2, audio)
+    result = asyncio.run(plugin._pool_review_once())
+    assert result["llm_used"] is False  # 纯算法
+    assert result["promoted"] == 2 and result["promoted_ultra"] == 1
+    tiers = sorted(v.get("tier") for v in plugin._pool.values())
+    assert tiers == ["pool", "ultra"]
+
+
+def test_review_promotes_ultra_by_hits_rule(tmp_path, monkeypatch):
+    """条件②：调用次数达标即进超长期池（与排名无关）。"""
+    plugin, _ = _pool_plugin(
+        tmp_path,
+        monkeypatch,
+        phrase_pool_llm_review=False,
+        phrase_ultra_top_rank=0,  # 关闭条件①
+        phrase_ultra_min_hits=3,
+        phrase_pool_min_hits=1,
+    )
+    audio = tmp_path / "a.mp3"
+    audio.write_bytes(b"x")
+    _seed_usage(plugin, "よく使う", 4, audio)
+    _seed_usage(plugin, "あまり使わない", 1, audio)
+    result = asyncio.run(plugin._pool_review_once())
+    assert result["promoted_ultra"] == 1
+    ultra_texts = [v["text"] for v in plugin._pool.values() if v.get("tier") == "ultra"]
+    assert ultra_texts == ["よく使う"]
+
+
+def test_review_llm_can_upgrade_and_evict(tmp_path, monkeypatch):
+    plugin, _ = _pool_plugin(
+        tmp_path,
+        monkeypatch,
+        phrase_pool_llm_review=True,
+        phrase_ultra_top_rank=0,
+        phrase_ultra_min_hits=0,  # 规则不晋级 ultra，交给 LLM
+    )
+    audio = tmp_path / "a.mp3"
+    audio.write_bytes(b"x")
+    _seed_usage(plugin, "汎用の挨拶", 3, audio)
+
+    class FakeProvider:
+        async def text_chat(self, prompt=None, system_prompt=None, **kw):
+            return type(
+                "R",
+                (),
+                {
+                    "completion_text": '{"ultra": [0], "keep": [], "evict": [], "reason": "通用问候"}'
+                },
+            )()
+
+    class FakeContext:
+        async def get_using_provider_async(self, umo=None):
+            return FakeProvider()
+
+    plugin.context = FakeContext()
+    result = asyncio.run(plugin._pool_review_once())
+    assert result["llm_used"] is True
+    assert result["promoted_ultra"] + result["upgraded_ultra"] == 1
+    assert result["ultra_entries"] == 1
+    assert list(plugin._pool.values())[0]["tier"] == "ultra"
+
+
+def test_pool_expire_is_tier_aware(tmp_path, monkeypatch):
+    """长期池保留 1 天、超长期池保留 365 天：只有长期池条目被回收。"""
+    plugin, pool_dir = _pool_plugin(
+        tmp_path, monkeypatch, phrase_pool_retention_days=1, phrase_ultra_retention_days=365
+    )
+    pool_dir.mkdir(parents=True, exist_ok=True)
+    stale = time.time() - 3 * 86400
+    keys = {}
+    for name, tier in (("pool", "pool"), ("ultra", "ultra")):
+        f = pool_dir / f"{name}.mp3"
+        f.write_bytes(b"x")
+        key = plugin._synth_cache_key(name, 5)
+        plugin._pool[key] = {
+            "path": str(f),
+            "text": name,
+            "hits": 5,
+            "last_used": stale,
+            "promoted_at": 0.0,
+            "tier": tier,
+        }
+        keys[name] = key
+    assert plugin._pool_expire() == 1
+    assert keys["pool"] not in plugin._pool  # 长期池过期回收
+    assert keys["ultra"] in plugin._pool  # 超长期池仍在保留期内
+
+
+def test_pool_enforce_limits_per_tier(tmp_path, monkeypatch):
+    plugin, pool_dir = _pool_plugin(
+        tmp_path,
+        monkeypatch,
+        phrase_pool_max_entries=1,
+        phrase_ultra_max_entries=1,
+    )
+    pool_dir.mkdir(parents=True, exist_ok=True)
+    for name, tier, hits in (
+        ("p1", "pool", 2),
+        ("p2", "pool", 8),
+        ("u1", "ultra", 3),
+        ("u2", "ultra", 9),
+    ):
+        f = pool_dir / f"{name}.mp3"
+        f.write_bytes(b"x")
+        key = plugin._synth_cache_key(name, 5)
+        plugin._pool[key] = {
+            "path": str(f),
+            "text": name,
+            "hits": hits,
+            "last_used": time.time(),
+            "promoted_at": 0.0,
+            "tier": tier,
+        }
+    removed = plugin._pool_enforce_limits()
+    assert removed == 2  # 每个 tier 各淘汰 1 条（权重最低）
+    texts = sorted(v["text"] for v in plugin._pool.values())
+    assert texts == ["p2", "u2"]
+
+
+def test_pool_retier_upgrades_existing_entry(tmp_path, monkeypatch):
+    plugin, pool_dir = _pool_plugin(tmp_path, monkeypatch)
+    pool_dir.mkdir(parents=True, exist_ok=True)
+    f = pool_dir / "x.mp3"
+    f.write_bytes(b"x")
+    key = plugin._synth_cache_key("昇格対象", 5)
+    plugin._pool[key] = {
+        "path": str(f),
+        "text": "昇格対象",
+        "hits": 3,
+        "last_used": time.time(),
+        "promoted_at": 0.0,
+        "tier": "pool",
+    }
+    assert plugin._pool_retier(key, "ultra") is True
+    assert plugin._pool[key]["tier"] == "ultra"
+    assert plugin._pool_retier(key, "ultra") is False  # 已经是该层级
