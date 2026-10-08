@@ -14,6 +14,8 @@
 >
 > 本插件所使用的软件为 **COEIROINK**，由**シロワニさん**制作，这是一个免费的 TTS 软件，
 > 请大家多多支持シロワニさん。官网以及下载：https://coeiroink.com/
+>
+> 本插件所使用的 Logo 由**ノザラシ**制作。获取链接：https://seiga.nicovideo.jp/seiga/im11798588
 
 ---
 

@@ -5,6 +5,7 @@
 
 音源：月读酱（Tsukuyomi-chan，夢前黎制作，免费音源 https://tyc.rei-yumesaki.net/）
 软件：COEIROINK（シロワニさん制作，免费 TTS https://coeiroink.com/）
+Logo：ノザラシ制作（https://seiga.nicovideo.jp/seiga/im11798588）
 
 引擎默认监听 127.0.0.1:50032，仅本机访问，不对外暴露。
 """

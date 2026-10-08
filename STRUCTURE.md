@@ -1,8 +1,9 @@
 # Tsukuyomi-chan COEIROINK 日语语音插件 · 结构说明（PLUGIN_STRUCTURE）
 
 > 本文档由代码实地梳理生成，只描述当前源码中**真实存在**的内容。
-> 版本：对应 `metadata.yaml` 的 `v1.2.1`（v1.2.0 起插件通用化：不再内置任何机器相关路径；
-> v1.2.1 起显示名改为 Tsukuyomi-chan COEIROINK 日语语音，并附音源/软件致谢）。
+> 版本：对应 `metadata.yaml` 的 `v1.2.2`（v1.2.0 起插件通用化：不再内置任何机器相关路径；
+> v1.2.1 起显示名改为 Tsukuyomi-chan COEIROINK 日语语音，并附音源/软件致谢；
+> v1.2.2 起补充 Logo 作者声明）。
 > 无法从代码/环境中确认的点，统一用「**待确认**」标注，不做臆测。
 
 > ### 🔊 音源与软件致谢
@@ -10,6 +11,7 @@
 > 请大家多多支持作者夢前黎。官网：https://tyc.rei-yumesaki.net/
 > 本插件所使用的软件为 **COEIROINK**，由**シロワニさん**制作，这是一个免费的 TTS 软件，
 > 请大家多多支持シロワニさん。官网以及下载：https://coeiroink.com/
+> 本插件所使用的 Logo 由**ノザラシ**制作。获取链接：https://seiga.nicovideo.jp/seiga/im11798588
 
 ---
 
@@ -30,7 +32,7 @@
 
 | 文件 | 职责 |
 | --- | --- |
-| `metadata.yaml` | 插件标识 `name: astrbot_plugin_coeiroink_tts`、`display_name: Tsukuyomi-chan COEIROINK 日语语音`、`version: v1.2.1`、`author: 索拉` |
+| `metadata.yaml` | 插件标识 `name: astrbot_plugin_coeiroink_tts`、`display_name: Tsukuyomi-chan COEIROINK 日语语音`、`version: v1.2.2`、`author: 索拉` |
 | `main.py` | 全部实现：常量、默认配置、风格归一化、文本清洗、引擎探测/拉起、合成链路、翻译、TTS Provider 适配器、插件主体（自动触发 + 命令 + LLM 工具） |
 | `_conf_schema.json` | 配置项定义，AstrBot 据此渲染配置面板；键名与 `main.py` 中 `DEFAULT_CONFIG` 一一对应 |
 | `README.md` | 用户文档：风格对照、配置方法、单次切换用法、非法值行为、内存提示 |
