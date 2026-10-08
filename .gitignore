@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 运行时生成的数据（AstrBot 数据目录、自测输出等）
+data/
+selftest_out/
+
+# 合成产生的临时音频
+*.wav
+*.mp3
+
+# 系统/编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
