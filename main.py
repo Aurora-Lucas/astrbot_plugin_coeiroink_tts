@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import asyncio
 import os
+import platform
 import random
 import re
 import shutil
 import subprocess
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -900,6 +902,7 @@ class CoeiroinkTTSPlugin(Star):
                     self.config[k] = v
         self._llm_tools_registered = False
         self._warmup_task: asyncio.Task | None = None
+        self._bg_tasks: set[asyncio.Task] = set()
 
     # ---------------- 配置 ----------------
 
@@ -995,6 +998,21 @@ class CoeiroinkTTSPlugin(Star):
             )
             self.context.register_web_api(
                 f"{api}/test", self._webui_test_synth, ["POST"], "测试合成一句话"
+            )
+            self.context.register_web_api(
+                f"{api}/install_info", self._webui_install_info, ["GET"], "安装向导：环境自检"
+            )
+            self.context.register_web_api(
+                f"{api}/install_check_path",
+                self._webui_install_check_path,
+                ["POST"],
+                "安装向导：校验引擎目录",
+            )
+            self.context.register_web_api(
+                f"{api}/install_launch_engine",
+                self._webui_install_launch_engine,
+                ["POST"],
+                "安装向导：后台启动引擎",
             )
         except Exception as e:  # noqa: BLE001
             logger.error(f"[COEIROINK] 注册 Web UI 接口失败：{e}")
@@ -1145,6 +1163,111 @@ class CoeiroinkTTSPlugin(Star):
             "style_id": style_id,
             "style_label": style_label(style_id),
             "file": path,
+        })
+
+    # ---------------- 安装向导（Web UI） ----------------
+
+    def _spawn_background_task(self, coro: Any) -> None:
+        """以后台任务运行（持有引用防 GC），完成后自动丢弃。"""
+        task = asyncio.create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+
+    async def _webui_install_info(self):
+        """GET /install_info：安装向导环境自检。"""
+        cfg_dir = resolve_engine_dir(self._cfg("engine_dir"))
+        bin_path = resolve_engine_bin(cfg_dir, self._cfg("engine_bin") or None)
+
+        candidates = [cfg_dir] if cfg_dir else []
+        try:
+            candidates.append(str(Path(get_astrbot_temp_path())))
+        except Exception:  # noqa: BLE001
+            pass
+        candidates.append(str(Path.home()))
+        disk: dict[str, Any] = {}
+        seen: set[str] = set()
+        for cand in candidates:
+            if not cand or cand in seen:
+                continue
+            seen.add(cand)
+            try:
+                usage = shutil.disk_usage(cand)
+                disk[cand] = {
+                    "total_gb": round(usage.total / 2**30, 1),
+                    "free_gb": round(usage.free / 2**30, 1),
+                }
+            except Exception:  # noqa: BLE001
+                disk[cand] = None
+
+        return json_response({
+            "platform": platform.platform(),
+            "os_name": os.name,
+            "python": sys.version.split()[0],
+            "ffmpeg": resolve_ffmpeg(self._cfg("ffmpeg_path")) or None,
+            "engine_dir": cfg_dir or None,
+            "engine_bin": bin_path,
+            "engine_bin_exists": bool(bin_path and os.path.isfile(bin_path)),
+            "engine_alive": await check_engine_alive(str(self._cfg("api_base") or "")),
+            "api_base": self._cfg("api_base"),
+            "mem_available_mb": available_memory_mb(),
+            "disk": disk,
+            "webui_enabled": self._webui_enabled(),
+        })
+
+    async def _webui_install_check_path(self):
+        """POST /install_check_path：校验用户填写的引擎目录（不保存配置）。
+
+        入参：{"engine_dir": "...", "engine_bin": "..."(可选)}
+        """
+        payload = await request.json(default=None)
+        if not isinstance(payload, dict):
+            return error_response("请求体必须是 JSON 对象", status_code=400)
+        engine_dir = str(payload.get("engine_dir") or "").strip()
+        engine_bin_cfg = str(payload.get("engine_bin") or "").strip() or None
+        if not engine_dir:
+            return error_response("请先填写引擎目录", status_code=400)
+        resolved_dir = resolve_engine_dir(engine_dir)
+        resolved_bin = resolve_engine_bin(resolved_dir, engine_bin_cfg)
+        exists = bool(resolved_bin and os.path.isfile(resolved_bin))
+        return json_response({
+            "engine_dir": resolved_dir,
+            "engine_dir_exists": os.path.isdir(resolved_dir),
+            "engine_bin": resolved_bin,
+            "engine_bin_exists": exists,
+            "ok": exists,
+        })
+
+    async def _webui_install_launch_engine(self):
+        """POST /install_launch_engine：后台拉起引擎（不阻塞请求，前端轮询状态）。"""
+        if not self._webui_enabled():
+            return error_response("Web UI 管理未启用", status_code=403)
+        api_base = str(self._cfg("api_base") or "")
+        if await check_engine_alive(api_base):
+            return json_response({
+                "ok": True, "already_alive": True, "message": "引擎已在运行，无需启动",
+            })
+        ensure_kwargs = {
+            "api_base": api_base,
+            "engine_dir": self._cfg("engine_dir"),
+            "engine_bin": self._cfg("engine_bin") or None,
+            "engine_log": self._cfg("engine_log"),
+            "auto_start": True,
+            "start_timeout": float(self._cfg("engine_start_timeout") or 90),
+        }
+        bin_path = resolve_engine_bin(
+            resolve_engine_dir(ensure_kwargs["engine_dir"]), ensure_kwargs["engine_bin"]
+        )
+        if not bin_path or not os.path.isfile(bin_path):
+            return error_response(
+                f"找不到引擎可执行文件（{bin_path or '未解析出路径'}）。"
+                "请先下载并解压引擎，再把引擎目录填入配置。",
+                status_code=400,
+            )
+        self._spawn_background_task(ensure_engine_running(**ensure_kwargs))
+        return json_response({
+            "ok": True,
+            "already_alive": False,
+            "message": "已在后台启动引擎，请稍候并刷新状态（首次冷启动约需 40~60 秒）",
         })
 
     # ---------------- 引擎 / 合成封装 ----------------
