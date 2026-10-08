@@ -236,15 +236,16 @@
       }
       const box = $("diskBox");
       box.innerHTML = "";
-      const entries = Object.entries(info.disk || {});
+      const entries = info.disk || [];
       if (entries.length) {
         const grid = document.createElement("div");
         grid.className = "grid";
-        entries.forEach(([path, d]) => {
+        entries.forEach((d) => {
           const s = document.createElement("div");
           s.className = "stat";
-          s.innerHTML = `<div class="k">磁盘（${path}）</div>` +
-            `<div class="v">${d ? `剩余 ${d.free_gb} GB / 共 ${d.total_gb} GB` : "不可读"}</div>`;
+          s.innerHTML =
+            `<div class="k">磁盘剩余（${(d.labels || [d.path]).join(" / ")}）</div>` +
+            `<div class="v">剩余 ${d.free_gb} GB / 共 ${d.total_gb} GB</div>`;
           grid.appendChild(s);
         });
         box.appendChild(grid);

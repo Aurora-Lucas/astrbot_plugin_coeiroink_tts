@@ -1178,26 +1178,48 @@ class CoeiroinkTTSPlugin(Star):
         cfg_dir = resolve_engine_dir(self._cfg("engine_dir"))
         bin_path = resolve_engine_bin(cfg_dir, self._cfg("engine_bin") or None)
 
-        candidates = [cfg_dir] if cfg_dir else []
+        # 三个候选位置目的不同、可能位于不同磁盘；按文件系统（st_dev）去重，
+        # 同一磁盘只返回一条，并在 labels 里保留各位置的用途说明。
+        candidates: list[tuple[str, str]] = []
+        if cfg_dir:
+            candidates.append(("引擎目录", cfg_dir))
         try:
-            candidates.append(str(Path(get_astrbot_temp_path())))
+            candidates.append(("AstrBot 临时目录", str(Path(get_astrbot_temp_path()))))
         except Exception:  # noqa: BLE001
             pass
-        candidates.append(str(Path.home()))
-        disk: dict[str, Any] = {}
-        seen: set[str] = set()
-        for cand in candidates:
-            if not cand or cand in seen:
+        candidates.append(("用户主目录", str(Path.home())))
+
+        disk: list[dict[str, Any]] = []
+        seen_paths: set[str] = set()
+        seen_devs: set[int] = set()
+        for label, cand in candidates:
+            if not cand or cand in seen_paths:
                 continue
-            seen.add(cand)
+            seen_paths.add(cand)
+            try:
+                dev = os.stat(cand).st_dev
+            except Exception:  # noqa: BLE001 - 路径不存在/不可读，跳过
+                continue
+            if dev in seen_devs:
+                for item in disk:
+                    if item.get("_dev") == dev:
+                        item["labels"].append(label)
+                        break
+                continue
+            seen_devs.add(dev)
             try:
                 usage = shutil.disk_usage(cand)
-                disk[cand] = {
-                    "total_gb": round(usage.total / 2**30, 1),
-                    "free_gb": round(usage.free / 2**30, 1),
-                }
             except Exception:  # noqa: BLE001
-                disk[cand] = None
+                continue
+            disk.append({
+                "_dev": dev,
+                "path": cand,
+                "labels": [label],
+                "total_gb": round(usage.total / 2**30, 1),
+                "free_gb": round(usage.free / 2**30, 1),
+            })
+        for item in disk:
+            item.pop("_dev", None)
 
         return json_response({
             "platform": platform.platform(),

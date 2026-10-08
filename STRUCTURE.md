@@ -6,7 +6,8 @@
 > v1.2.2 起补充 Logo 作者声明；v1.2.3 起补充渠道支持说明；
 > v1.3.0 起内置 Web UI 图形化管理面板（可开关，开启后原配置面板仅保留开关）；
 > v1.3.1 起在 README 与插件描述中加入本地 TTS 宣传介绍；
-> v1.4.0 起新增 Web UI 安装向导页（环境自检/下载指引/目录校验/后台启动/合成验证）。
+> v1.4.0 起新增 Web UI 安装向导页（环境自检/下载指引/目录校验/后台启动/合成验证）；
+> v1.4.1 起安装向导磁盘自检按文件系统去重，避免同一磁盘重复显示）。
 > 无法从代码/环境中确认的点，统一用「**待确认**」标注，不做臆测。
 
 > ### 🔊 音源与软件致谢
@@ -131,7 +132,7 @@
   - `_webui_status()`：引擎探活、可用内存、当前风格、引擎进程 PID、解析后的 engine_bin/ffmpeg 等
   - `_webui_test_synth()`：`enable_webui` 关闭时返回 403；否则按当前配置合成一句测试语音（已是日语则跳过翻译）
   - **安装向导**：
-    - `_webui_install_info()`：环境自检（`platform.platform()`、Python、ffmpeg、可用内存、候选目录磁盘剩余空间、引擎目录/可执行文件解析与存在性、引擎探活）
+    - `_webui_install_info()`：环境自检（`platform.platform()`、Python、ffmpeg、可用内存、候选目录磁盘剩余空间——**按文件系统 `st_dev` 去重**，同一磁盘只返回一条并合并用途标签、引擎目录/可执行文件解析与存在性、引擎探活）
     - `_webui_install_check_path()`：校验用户填写的引擎目录（解析 engine_dir/engine_bin 并检查存在性，**不保存配置**）
     - `_webui_install_launch_engine()`：`enable_webui` 关闭时 403；引擎已运行时返回 `already_alive`；可执行文件缺失时 400 并提示先下载解压；否则经 `_spawn_background_task` 后台调用 `ensure_engine_running`，立即返回，由前端轮询 `/status` 就绪状态
     - `_spawn_background_task(coro)`：`asyncio.create_task` + `_bg_tasks` 集合持有引用，完成后自动丢弃
