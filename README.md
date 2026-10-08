@@ -1,5 +1,7 @@
 # Tsukuyomi-chan COEIROINK 日语语音（AstrBot 插件）
 
+<p align="center"><img src="logo.png" alt="Tsukuyomi-chan" width="128"></p>
+
 使用本地 **COEIROINK** CPU 引擎，把 AstrBot 的回复文本（必要时先由大模型翻译成日语）
 合成为语音，并以语音消息发出。
 
